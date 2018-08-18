@@ -1,42 +1,40 @@
 use std::borrow::Borrow;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 type Address = usize;
 
-
-pub struct AtomicHeap<P> {
-    arr: Vec<P>, // ArcMutex
-    // either cells or
+pub struct FakeAtomicVec<T> {
+    arr: Arc<Mutex<Vec<T>>>,
 }
 
-impl <P> AtomicHeap<P> {
-    pub fn new(capacity: usize) -> AtomicHeap<P> {
-        let v = Vec::with_capacity(capacity);
-        AtomicHeap {
-            arr: v,
+impl <T> FakeAtomicVec<T> {
+    pub fn with_capacity(capacity: usize) -> FakeAtomicVec<T> {
+        FakeAtomicVec {
+            arr: Arc::new(Mutex::new(Vec::with_capacity(capacity))),
         }
     }
+}
 
-    pub fn collector<'a>(&'a self) -> Collector<'a, P> {
-        Collector{table:self}
-    }
 
-    pub fn transaction<'a>(&'a self, collector: &'a Collector<'a, P>) -> Transaction<'a, P> {
-        Transaction {table:self, collector: collector} 
-    }
 
+struct Delete<P> {
+    epoch: usize,
+    value: P,
 }
 
 pub struct Collector<'a, P: 'a> {
-    table: &'a AtomicHeap<P>,
+    table: &'a SharedHeap<P>,
+    delete: FakeAtomicVec<Delete<P>>, // ArcMutex
     // read_set
 } 
+
 impl <'a, P> Collector<'a, P> {
     fn collect_later(&self, epoch: usize, value: *mut P) {
         unimplemented!()
     }
     pub fn collect(&mut self) {
         // read current epoch, 
-        unimplemented!()
     }
 }
 
@@ -46,10 +44,41 @@ impl<'a, T> Drop for Collector<'a, T> {
         ;
     }
 }
+pub struct SharedHeap<P> {
+    arr: FakeAtomicVec<P>, // ArcMutex
+    epoch: AtomicUsize
+    // either cells or
+}
+
+impl <P> SharedHeap<P> {
+    pub fn new(capacity: usize) -> SharedHeap<P> {
+        let v = FakeAtomicVec::with_capacity(capacity);
+        let e = AtomicUsize::new(0);
+        SharedHeap {
+            arr: v,
+            epoch: e,
+        }
+    }
+
+    fn current_epoch(&self) -> usize {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn collector<'a>(&'a self) -> Collector<'a, P> {
+        let v = FakeAtomicVec::with_capacity(20);
+        Collector {table:self, delete: v}
+    }
+
+    pub fn transaction<'a>(&'a self, collector: &'a Collector<'a, P>) -> Transaction<'a, P> {
+        Transaction {table:self, collector: collector, epoch: self.current_epoch()} 
+    }
+
+}
 
 pub struct Transaction<'a, P: 'a> {
-    table: &'a AtomicHeap<P>,
+    table: &'a SharedHeap<P>,
     collector: &'a Collector<'a, P>,
+    epoch: usize,
     // read_set
 }
 
@@ -59,7 +88,7 @@ impl <'a, P> Transaction<'a, P> {
         // find first empty slot
         // turn box into a pointer
         // swap it inside.
-        unimplemented!()
+        Ok(1)
     }
     
     pub fn upsert<U: Fn(&mut P)>(&mut self, address: Address, value: P, on_conflict: U) {
@@ -113,11 +142,11 @@ impl<'a, T> Drop for Transaction<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use AtomicHeap;
+    use SharedHeap;
     use std::sync::Arc;
     #[test]
     fn it_works() {
-        let h = Arc::new(AtomicHeap::new(1024));
+        let h = Arc::new(SharedHeap::new(1024));
         let mut c = h.collector();
         let mut addr = 0;
         {
