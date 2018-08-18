@@ -1,0 +1,6 @@
+[package]
+name = "atomicheap"
+version = "0.1.0"
+authors = ["tef <tef@twentygototen.org>"]
+
+[dependencies]
