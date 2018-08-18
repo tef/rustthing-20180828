@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 type Address = usize;
 
-pub struct FakeAtomicVec<T> {
+pub struct AtomicVec<T> {
     arr: Arc<Mutex<Vec<T>>>,
 }
 
-impl <T> FakeAtomicVec<T> {
-    pub fn with_capacity(capacity: usize) -> FakeAtomicVec<T> {
-        FakeAtomicVec {
+impl <T> AtomicVec<T> {
+    pub fn with_capacity(capacity: usize) -> AtomicVec<T> {
+        AtomicVec {
             arr: Arc::new(Mutex::new(Vec::with_capacity(capacity))),
         }
     }
@@ -18,14 +18,19 @@ impl <T> FakeAtomicVec<T> {
 
 
 
+enum HeapEntry<P> {
+    Value(P),
+    Transaction(usize),
+}
+
 struct Delete<P> {
     epoch: usize,
     value: P,
 }
 
 pub struct Collector<'a, P: 'a> {
-    table: &'a SharedHeap<P>,
-    delete: FakeAtomicVec<Delete<P>>, // ArcMutex
+    heap: &'a SharedHeap<P>,
+    delete: AtomicVec<Delete<P>>, // ArcMutex
     // read_set
 } 
 
@@ -44,39 +49,9 @@ impl<'a, T> Drop for Collector<'a, T> {
         ;
     }
 }
-pub struct SharedHeap<P> {
-    arr: FakeAtomicVec<P>, // ArcMutex
-    epoch: AtomicUsize
-    // either cells or
-}
-
-impl <P> SharedHeap<P> {
-    pub fn new(capacity: usize) -> SharedHeap<P> {
-        let v = FakeAtomicVec::with_capacity(capacity);
-        let e = AtomicUsize::new(0);
-        SharedHeap {
-            arr: v,
-            epoch: e,
-        }
-    }
-
-    fn current_epoch(&self) -> usize {
-        self.epoch.load(Ordering::SeqCst)
-    }
-
-    pub fn collector<'a>(&'a self) -> Collector<'a, P> {
-        let v = FakeAtomicVec::with_capacity(20);
-        Collector {table:self, delete: v}
-    }
-
-    pub fn transaction<'a>(&'a self, collector: &'a Collector<'a, P>) -> Transaction<'a, P> {
-        Transaction {table:self, collector: collector, epoch: self.current_epoch()} 
-    }
-
-}
 
 pub struct Transaction<'a, P: 'a> {
-    table: &'a SharedHeap<P>,
+    table: &'a AtomicVec<HeapEntry<P>>,
     collector: &'a Collector<'a, P>,
     epoch: usize,
     // read_set
@@ -139,6 +114,37 @@ impl<'a, T> Drop for Transaction<'a, T> {
     }
 }
 
+
+pub struct SharedHeap<P> {
+    table: AtomicVec<HeapEntry<P>>, // ArcMutex
+    epoch: AtomicUsize
+    // either cells or
+}
+
+impl <P> SharedHeap<P> {
+    pub fn new(capacity: usize) -> SharedHeap<P> {
+        let t = AtomicVec::with_capacity(capacity);
+        let e = AtomicUsize::new(0);
+        SharedHeap {
+            table: t,
+            epoch: e,
+        }
+    }
+
+    fn current_epoch(&self) -> usize {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    pub fn collector<'a>(&'a self) -> Collector<'a, P> {
+        let v = AtomicVec::with_capacity(20);
+        Collector {heap:self, delete: v}
+    }
+
+    pub fn transaction<'a>(&'a self, collector: &'a Collector<'a, P>) -> Transaction<'a, P> {
+        Transaction {table: &self.table, collector: collector, epoch: self.current_epoch()} 
+    }
+
+}
 
 #[cfg(test)]
 mod tests {
