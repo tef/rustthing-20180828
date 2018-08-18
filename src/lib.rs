@@ -39,7 +39,7 @@ enum HeapEntry<P> {
 
 pub struct Transaction<'a, P: 'a> {
     heap: &'a SharedHeap<P>,
-    session: &'a Session<'a, P>,
+    session: &'a mut Session<'a, P>,
     epoch: usize,
     // read_set
 }
@@ -122,7 +122,7 @@ impl <'a, P> Session<'a, P> {
     pub fn collect(&mut self) {
         // read current epoch, 
     }
-    pub fn transaction<'b: 'a>(&'b self) -> Transaction<'b, P> {
+    pub fn transaction<'b: 'a>(&'b mut self) -> Transaction<'b, P> {
         Transaction {
             heap: self.heap, 
             session: self, 
