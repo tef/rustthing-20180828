@@ -38,8 +38,7 @@ enum HeapEntry<P> {
 }
 
 pub struct Transaction<'a, P: 'a> {
-    heap: &'a SharedHeap<P>,
-    session: &'a mut Session<'a, P>,
+    session: &'a Session<'a, P>,
     epoch: usize,
     // read_set
 }
@@ -122,9 +121,8 @@ impl <'a, P> Session<'a, P> {
     pub fn collect(&mut self) {
         // read current epoch, 
     }
-    pub fn transaction<'b: 'a>(&'b mut self) -> Transaction<'b, P> {
+    pub fn transaction<'b>(&'b mut self) -> Transaction<'b, P> {
         Transaction {
-            heap: self.heap, 
             session: self, 
             epoch: self.heap.current_epoch(),
         } 
@@ -172,16 +170,18 @@ mod tests {
     #[test]
     fn it_works() {
         let h = Arc::new(SharedHeap::new(1024));
-        let mut s = h.session();
-        let mut addr = 0;
         {
-            let mut txn = s.transaction();
-            addr = txn.insert("example".to_string()).unwrap();
+            let mut s = h.session();
+            let mut addr = 0;
+            {
+                let mut txn = s.transaction();
+                addr = txn.insert("example".to_string()).unwrap();
+            }
+            {
+                let mut txn = s.transaction();
+                addr = txn.insert("example".to_string()).unwrap();
+            }
+            s.collect();
         }
-        {
-            let mut txn = s.transaction();
-            addr = txn.insert("example".to_string()).unwrap();
-        }
-        s.collect();
     }
 }
