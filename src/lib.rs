@@ -4,7 +4,6 @@
 use std::borrow::Borrow;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::marker::PhantomData;
 use std::ptr;
 use std::mem;
 
@@ -67,15 +66,20 @@ impl <T> AtomicPtrVec<T> {
             }
         }
     }
+    pub unsafe fn to_vec(&mut self) -> Vec<*mut T> {
+        let v = Vec::from_raw_parts(self.ptr, self.len.load(Ordering::SeqCst), self.cap);
+        mem::transmute(v)
+    }
 }
 
 
 struct CAS<T> {index: usize, old: *mut T, new: *mut T}
 
-enum State { Uncommitted, Committing, Committed, Cancelled }
+#[derive(PartialEq)]
+enum State { Reading = 0, Uncommitted = 1 , Committing = 2, Committed = 3 , Cancelled = -1 }
 
 struct Descriptor<T> {
-    state: State,
+    state: State, // Make Atomic
     operations: Vec<CAS<T>>,
 }
 
@@ -83,7 +87,7 @@ impl <T> Descriptor<T> {
     fn new() -> Descriptor<T> {
         let mut vec = Vec::with_capacity(8);
         Descriptor {
-            state: State::Uncommitted,
+            state: State::Reading,
             operations: vec,
         }
     }
@@ -103,13 +107,16 @@ pub struct Transaction<'a, P: 'a> {
 
 
 impl <'a, P> Transaction<'a, P> {
-    pub fn fake_item(&self) -> *mut P {
+    fn fake_item(&self) -> *mut P {
         let ptr: usize = unsafe { mem::transmute(self.descriptor) };
         let ptr = ptr | 1;
         unsafe{mem::transmute(self.descriptor)}
     }
+          
     pub fn borrow(&mut self, address:Address) -> &'a P {
         let ptr = self.vec.load(address);
+        // check for fake record, race ...
+        // check for null pointer, panic
         unsafe { &*ptr }
     }
     
@@ -119,6 +126,10 @@ impl <'a, P> Transaction<'a, P> {
         let addr = self.vec.append(fake).unwrap();
         unsafe {
             let d = &mut *self.descriptor;
+            if d.state != State::Reading && d.state != State::Committing {
+                panic!("welp");
+            }
+            d.state = State::Committing;
             d.add(addr, fake, ptr);
         }
         addr
@@ -144,21 +155,38 @@ impl <'a, P> Transaction<'a, P> {
     pub fn apply(&mut self) -> bool {
         unsafe {
             let d = &mut *self.descriptor;
-            for x in &d.operations {
-                let result = self.vec.compare_and_swap(x.index, x.old, x.new);
-                
-                print!("apply {}", x.index);
+            if d.state == State::Cancelled {
+                panic!("Cancelled!");
             }
+            if d.state == State::Uncommitted {
+                d.state = State::Committed;
+                let fake = self.fake_item();
+                for x in &d.operations {
+                    if x.old != fake {
+                        let result = self.vec.compare_and_swap(x.index, x.old, x.new);
+                        // check for success, or race
+                    }
+                }
+                for x in &d.operations {
+                    let result = self.vec.compare_and_swap(x.index, x.old, x.new);
+                    // check for success, or race
+                }
+            }
+            d.state = State::Committed;
+            // free / collect old values
         }
-        // in pessimistic, unlock each item and repl        ace it
-        // in optimistic, lock each item, validate unchanged
-        // return
         true
     }
+
     pub fn cancel(&mut self) -> bool {
-        // race to undo
+        unsafe {
+            let d = &mut *self.descriptor;
+            d.state = State::Cancelled;
+            // free inserted records
+        }
         true
     }
+
     pub fn upsert<U: Fn(&mut P)>(&mut self, address: Address, value: P, on_conflict: U) {
         // read, copy, update
         unimplemented!()
@@ -238,9 +266,12 @@ impl <P> AtomicHeap<P> {
 
 impl<T> Drop for AtomicHeap<T> {
     fn drop(&mut self) {
-        // to_vec() on atomicvecptr
-        // then iterate, panic on locked entry
-        // and then rebox and drop
+        let v = unsafe { self.vec.to_vec() };
+        for i in v {
+            if !i.is_null() {
+                unsafe { Box::from_raw(i) };
+            }
+        }
     }
 }
 
@@ -261,12 +292,10 @@ mod tests {
             addr = txn.insert("example".to_string());
             txn.apply();
         }
-        print!("two \n");
         {
             let mut txn2 = h.transaction(&mut s);
             let o = txn2.borrow(addr);
-            let uptr: usize = unsafe {mem::transmute(o)};
-            print!("read: {}\n", uptr);
+            print!("read: {}\n", o);
         }
         s.collect();
     }
