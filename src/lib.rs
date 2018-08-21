@@ -105,6 +105,15 @@ pub struct Transaction<'a, P: 'a> {
     collector: &'a Collector<'a, P>,
 }
 
+struct Ref<'a, T:'a> {
+    ptr: *'a mut T,
+}
+
+impl <'a,T> Deref for Ref<'a,T> {
+    type Target = T;
+    fn deref(&self) -> &T { unsafe { &*self.ptr} }
+}
+}
 
 impl <'a, P> Transaction<'a, P> {
     fn fake_item(&self) -> *mut P {
@@ -145,7 +154,12 @@ impl <'a, P> Transaction<'a, P> {
         unimplemented!()
     }
 
-    pub fn replace(&mut self, address:Address, value:P) {
+    pub fn upsert<U: Fn(&mut P)>(&mut self, address: Address, value: P, on_conflict: U) {
+        // read, copy, update
+        unimplemented!()
+    }
+
+    pub fn overwrite(&mut self, address:Address, value:P) {
         // same as read, placeholder
         // list of things to write when done
 
@@ -187,10 +201,6 @@ impl <'a, P> Transaction<'a, P> {
         true
     }
 
-    pub fn upsert<U: Fn(&mut P)>(&mut self, address: Address, value: P, on_conflict: U) {
-        // read, copy, update
-        unimplemented!()
-    }
 }
 
 impl<'a, T> Drop for Transaction<'a, T> {
