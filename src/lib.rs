@@ -6,6 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::ptr;
 use std::mem;
+use std::ops::Deref;
+use std::fmt;
+use std::marker::PhantomData;
+use std::clone::Clone;
 
 type Address = usize;
 
@@ -76,7 +80,7 @@ impl <T> AtomicPtrVec<T> {
 struct CAS<T> {index: usize, old: *mut T, new: *mut T}
 
 #[derive(PartialEq)]
-enum State { Reading = 0, Uncommitted = 1 , Committing = 2, Committed = 3 , Cancelled = -1 }
+enum State { Reading = 0, Writing = 1 , Committing = 2, Committed = 3 , Cancelled = -1 }
 
 struct Descriptor<T> {
     state: State, // Make Atomic
@@ -105,28 +109,39 @@ pub struct Transaction<'a, P: 'a> {
     collector: &'a Collector<'a, P>,
 }
 
-struct Ref<'a, T:'a> {
-    ptr: *'a mut T,
-}
-
-impl <'a,T> Deref for Ref<'a,T> {
-    type Target = T;
-    fn deref(&self) -> &T { unsafe { &*self.ptr} }
-}
-}
-
-impl <'a, P> Transaction<'a, P> {
+impl <'a, P: std::clone::Clone> Transaction<'a, P> {
     fn fake_item(&self) -> *mut P {
         let ptr: usize = unsafe { mem::transmute(self.descriptor) };
         let ptr = ptr | 1;
         unsafe{mem::transmute(self.descriptor)}
     }
           
-    pub fn borrow(&mut self, address:Address) -> &'a P {
+    pub fn read(&mut self, address:Address) -> &'a P {
         let ptr = self.vec.load(address);
         // check for fake record, race ...
         // check for null pointer, panic
         unsafe { &*ptr }
+        // Ref {ptr: ptr, _marker: PhantomData}
+    }
+
+    pub fn copy(&mut self, address:Address) -> P {
+        // same as read, but copying instead of borrowing
+        let ptr = self.vec.load(address);
+        // check for fake record, race ...
+        // check for null pointer, panic
+        unsafe { (*ptr).clone() }
+    }
+
+    pub fn update(&mut self, address: Address, old: &'a P, new: P) {
+        let new_ptr = Box::into_raw(Box::new(new));
+        unsafe {
+            let d = &mut *self.descriptor;
+            if d.state != State::Reading && d.state != State::Writing {
+                panic!("welp");
+            }
+            d.state = State::Writing;
+            d.add(address, mem::transmute(old), new_ptr);
+        }
     }
     
     pub fn insert(&mut self, value: P) -> Address {
@@ -135,10 +150,10 @@ impl <'a, P> Transaction<'a, P> {
         let addr = self.vec.append(fake).unwrap();
         unsafe {
             let d = &mut *self.descriptor;
-            if d.state != State::Reading && d.state != State::Committing {
+            if d.state != State::Reading && d.state != State::Writing {
                 panic!("welp");
             }
-            d.state = State::Committing;
+            d.state = State::Writing;
             d.add(addr, fake, ptr);
         }
         addr
@@ -146,42 +161,53 @@ impl <'a, P> Transaction<'a, P> {
     
 
     pub fn delete(&mut self, address: Address) {
-        unimplemented!()
+        let old = self.vec.load(address);
+        unsafe {
+            let d = &mut *self.descriptor;
+            if d.state != State::Reading && d.state != State::Writing {
+                panic!("welp");
+            }
+            d.state = State::Writing;
+            d.add(address, old, ptr::null_mut());
+        }
+    }
+    pub fn overwrite(&mut self, address:Address, value:P) {
+        let ptr = Box::into_raw(Box::new(value));
+        let old = self.vec.load(address);
+        // check descriptor
+        unsafe {
+            let d = &mut *self.descriptor;
+            if d.state != State::Reading && d.state != State::Writing {
+                panic!("welp");
+            }
+            d.state = State::Writing;
+            d.add(address, old, ptr);
+        }
     }
 
-    pub fn copy(&mut self, address:Address) -> P {
-        // same as read, but copying instead of borrowing
-        unimplemented!()
-    }
 
     pub fn upsert<U: Fn(&mut P)>(&mut self, address: Address, value: P, on_conflict: U) {
         // read, copy, update
         unimplemented!()
     }
 
-    pub fn overwrite(&mut self, address:Address, value:P) {
-        // same as read, placeholder
-        // list of things to write when done
-
-        // optimisitic has write list & if read set promotes it
-        unimplemented!()
-    }
     pub fn apply(&mut self) -> bool {
         unsafe {
             let d = &mut *self.descriptor;
-            if d.state == State::Cancelled {
-                panic!("Cancelled!");
+            if d.state == State::Committing || d.state == State::Cancelled {
+                panic!("welp");
             }
-            if d.state == State::Uncommitted {
-                d.state = State::Committed;
+            if d.state == State::Writing {
                 let fake = self.fake_item();
                 for x in &d.operations {
                     if x.old != fake {
+                        print!("new\n");
                         let result = self.vec.compare_and_swap(x.index, x.old, x.new);
                         // check for success, or race
                     }
                 }
                 for x in &d.operations {
+                    print!("replace\n");
                     let result = self.vec.compare_and_swap(x.index, x.old, x.new);
                     // check for success, or race
                 }
@@ -244,7 +270,7 @@ pub struct AtomicHeap<P> {
     epoch: AtomicUsize,
 }
 
-impl <P> AtomicHeap<P> {
+impl <P: std::clone::Clone> AtomicHeap<P> {
     pub fn new(capacity: usize) -> AtomicHeap<P> {
         let t = AtomicPtrVec::new(capacity);
         let e = AtomicUsize::new(0);
@@ -285,6 +311,24 @@ impl<T> Drop for AtomicHeap<T> {
     }
 }
 
+pub struct Ref<'a, T:'a> {
+    ptr: *mut T,
+    _marker: PhantomData<&'a T>,
+}
+
+impl <'a, T> Deref for Ref<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T { unsafe { &*self.ptr} }
+}
+
+impl <'a, T> Borrow<T> for Ref<'a, T> {
+    fn borrow(&self) -> &T { unsafe { &*self.ptr} }
+}
+impl <'a, T: fmt::Display> fmt::Display for Ref<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(unsafe{&*self.ptr}, f)
+    }
+}
 #[cfg(test)]
 mod tests {
     use AtomicHeap;
@@ -304,7 +348,7 @@ mod tests {
         }
         {
             let mut txn2 = h.transaction(&mut s);
-            let o = txn2.borrow(addr);
+            let o = txn2.read(addr);
             print!("read: {}\n", o);
         }
         s.collect();
