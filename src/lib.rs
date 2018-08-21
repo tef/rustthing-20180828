@@ -70,6 +70,7 @@ impl <T> AtomicPtrVec<T> {
             }
         }
     }
+    // as_mut_slice() instead
     pub unsafe fn to_vec(&mut self) -> Vec<*mut T> {
         let v = Vec::from_raw_parts(self.ptr, self.len.load(Ordering::SeqCst), self.cap);
         mem::transmute(v)
@@ -116,24 +117,24 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
         unsafe{mem::transmute(self.descriptor)}
     }
           
-    pub fn read(&mut self, address:Address) -> &'a P {
+    pub fn read(&mut self, address:Address) -> Option<&'a P> {
         let ptr = self.vec.load(address);
         // check for fake record, race ...
         // check for null pointer, panic
-        unsafe { &*ptr }
+        unsafe { Some(&*ptr) }
         // Ref {ptr: ptr, _marker: PhantomData}
     }
 
-    pub fn copy(&mut self, address:Address) -> P {
+    pub fn copy(&mut self, address:Address) -> Option<Box<P>> {
         // same as read, but copying instead of borrowing
         let ptr = self.vec.load(address);
         // check for fake record, race ...
         // check for null pointer, panic
-        unsafe { (*ptr).clone() }
+        unsafe { Some(Box::new((*ptr).clone())) }
     }
 
-    pub fn update(&mut self, address: Address, old: &'a P, new: P) {
-        let new_ptr = Box::into_raw(Box::new(new));
+    pub fn update(&mut self, address: Address, old: &'a P, new: Box<P>) {
+        let new_ptr = Box::into_raw(new);
         unsafe {
             let d = &mut *self.descriptor;
             if d.state != State::Reading && d.state != State::Writing {
@@ -144,8 +145,8 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
         }
     }
     
-    pub fn insert(&mut self, value: P) -> Address {
-        let ptr = Box::into_raw(Box::new(value));
+    pub fn insert(&mut self, value: Box<P>) -> Address {
+        let ptr = Box::into_raw(value);
         let fake = self.fake_item();
         let addr = self.vec.append(fake).unwrap();
         unsafe {
@@ -186,9 +187,31 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
     }
 
 
-    pub fn upsert<U: Fn(&mut P)>(&mut self, address: Address, value: P, on_conflict: U) {
-        // read, copy, update
-        unimplemented!()
+    pub fn upsert<U: Fn(&mut P)>(&mut self, address: Address, value: Box<P>, on_conflict: U) {
+        let old = self.vec.load(address);
+        if old.is_null() {
+            let ptr = Box::into_raw(value);
+            unsafe {
+                let d = &mut *self.descriptor;
+                if d.state != State::Reading && d.state != State::Writing {
+                    panic!("welp");
+                }
+                d.state = State::Writing;
+                d.add(address, ptr::null_mut(), ptr);
+            }
+        } else { 
+            let mut b = unsafe { Box::new( (*old).clone() ) };
+            on_conflict(&mut b);
+            let ptr = Box::into_raw(b);
+            unsafe {
+                let d = &mut *self.descriptor;
+                if d.state != State::Reading && d.state != State::Writing {
+                    panic!("welp");
+                }
+                d.state = State::Writing;
+                d.add(address, old, ptr);
+            }
+        }
     }
 
     pub fn apply(&mut self) -> bool {
@@ -218,13 +241,25 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
         true
     }
 
-    pub fn cancel(&mut self) -> bool {
+    pub fn cancel(&mut self) {
         unsafe {
             let d = &mut *self.descriptor;
-            d.state = State::Cancelled;
             // free inserted records
+            if d.state == State::Committing || d.state == State::Cancelled {
+                panic!("welp");
+            }
+            if d.state == State::Writing {
+                let fake = self.fake_item();
+                for x in &d.operations {
+                    if x.old == fake {
+                        let result = self.vec.compare_and_swap(x.index, fake, ptr::null_mut());
+                        // check for success, or race
+                        // free / collect old values
+                    }
+                }
+            }
+            d.state = State::Cancelled;
         }
-        true
     }
 
 }
@@ -343,12 +378,12 @@ mod tests {
         let mut addr = 0;
         {
             let mut txn = h.transaction(&mut s);
-            addr = txn.insert("example".to_string());
+            addr = txn.insert(Box::new("example".to_string()));
             txn.apply();
         }
         {
             let mut txn2 = h.transaction(&mut s);
-            let o = txn2.read(addr);
+            let o = txn2.read(addr).unwrap();
             print!("read: {}\n", o);
         }
         s.collect();
