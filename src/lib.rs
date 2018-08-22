@@ -105,6 +105,11 @@ impl <T: std::clone::Clone> Descriptor<T> {
         }
     }
     fn add(&mut self, index: usize, old: *mut T, new: *mut T) {
+        if self.state == State::Reading {
+            self.state = State::Writing;
+        } else if self.state != State::Writing {
+            panic!("welp");
+        }
         self.operations.push( 
             CAS {index: index, old: old, new: new}
         );
@@ -167,86 +172,80 @@ pub struct Transaction<'a, P: 'a + std::clone::Clone> {
 
 impl <'a, P: std::clone::Clone> Transaction<'a, P> {
     pub fn apply(&mut self) -> bool {
-        unsafe {
-            let d = &mut *self.descriptor;
-            d.apply(&self.vec)
-        }
+        unsafe { (&mut *self.descriptor).apply(&self.vec) }
     }
 
     pub fn cancel(&mut self) {
-        unsafe {
-            let d = &mut *self.descriptor;
-            d.cancel(&self.vec)
-        }
+        unsafe { (&mut *self.descriptor).cancel(&self.vec) }
+    }
+    pub fn is_tagged(ptr: *mut P) -> bool {
+        let ptr: usize = unsafe{mem::transmute(ptr)};
+        ptr & 1 == 1
     }
           
     pub fn read(&mut self, address:Address) -> Option<&'a P> {
         let ptr = self.vec.load(address);
-        // XXX check for fake record, race ...
-        // XXX check for null pointer, panic
-        unsafe { Some(&*ptr) }
+        if ptr.is_null() || Transaction::is_tagged(ptr) {
+            None
+        } else {
+            unsafe { Some(&*ptr) }
+        }
     }
 
     pub fn copy(&mut self, address:Address) -> Option<Box<P>> {
         let ptr = self.vec.load(address);
-        // XXX check for fake record, race ...
-        // XXX check for null pointer, panic
-        unsafe { Some(Box::new((*ptr).clone())) }
+        if ptr.is_null() || Transaction::is_tagged(ptr) {
+            None
+        } else {
+            unsafe { Some(Box::new((*ptr).clone())) }
+        }
     }
 
     pub fn update(&mut self, address: Address, old: &'a P, new: Box<P>) {
         let new_ptr = Box::into_raw(new);
         unsafe {
             let d = &mut *self.descriptor;
-            if d.state != State::Reading && d.state != State::Writing {
-                panic!("welp");
-            }
-            d.state = State::Writing;
             d.add(address, mem::transmute(old), new_ptr);
         }
     }
     
     pub fn insert(&mut self, value: Box<P>) -> Address {
+        let ptr = Box::into_raw(value);
         unsafe {
             let d = &mut *self.descriptor;
-            if d.state != State::Reading && d.state != State::Writing {
-                panic!("welp");
-            }
-            let ptr = Box::into_raw(value);
             let fake = d.tagged_ptr();
             let addr = self.vec.append(fake).unwrap();
-            d.state = State::Writing;
             d.add(addr, fake, ptr);
             addr
         }
     }
     
 
-    pub fn delete(&mut self, address: Address) {
+    pub fn delete(&mut self, address: Address) -> bool {
         let old = self.vec.load(address);
-        if !old.is_null() {
+        if old.is_null() || Transaction::is_tagged(old) {
+            false
+        } else {
             unsafe {
                 let d = &mut *self.descriptor;
-                if d.state != State::Reading && d.state != State::Writing {
-                    panic!("welp");
-                }
-                d.state = State::Writing;
                 d.add(address, old, ptr::null_mut());
             } 
+            true
         }
     }
 
-    pub fn overwrite(&mut self, address:Address, value:P) {
+    pub fn overwrite(&mut self, address:Address, value:P) -> bool {
         let ptr = Box::into_raw(Box::new(value));
         let old = self.vec.load(address);
-        // XXX check descriptor
-        unsafe {
-            let d = &mut *self.descriptor;
-            if d.state != State::Reading && d.state != State::Writing {
-                panic!("welp");
+        if Transaction::is_tagged(old) {
+            false
+        } else {
+            // XXX check descriptor
+            unsafe {
+                let d = &mut *self.descriptor;
+                d.add(address, old, ptr);
             }
-            d.state = State::Writing;
-            d.add(address, old, ptr);
+            true
         }
     }
 
@@ -257,10 +256,6 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
             let ptr = Box::into_raw(value);
             unsafe {
                 let d = &mut *self.descriptor;
-                if d.state != State::Reading && d.state != State::Writing {
-                    panic!("welp");
-                }
-                d.state = State::Writing;
                 d.add(address, ptr::null_mut(), ptr);
             }
         } else { 
@@ -269,10 +264,6 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
             let ptr = Box::into_raw(b);
             unsafe {
                 let d = &mut *self.descriptor;
-                if d.state != State::Reading && d.state != State::Writing {
-                    panic!("welp");
-                }
-                d.state = State::Writing;
                 d.add(address, old, ptr);
             }
         }
@@ -320,6 +311,7 @@ impl <'a, P: std::clone::Clone> Collector<'a, P> {
 impl<'a, T: std::clone::Clone> Drop for Collector<'a, T> {
     fn drop(&mut self) {
         // spin and collect ?
+        // push onto heap's shared list
         ;
     }
 }
