@@ -14,7 +14,6 @@ use std::clone::Clone;
 
 // todo: make Descriptor use atomic state
 //       conflicted state
-//       make txn drop dispose of new/old items
 //       Descriptor::race()
 //       collector free list
 //       heap free list
@@ -92,7 +91,7 @@ impl <T> AtomicPtrVec<T> {
 
 struct CAS<T> {index: usize, old: *mut T, new: *mut T}
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Copy, Clone)]
 enum State { Reading = 0, Writing = 1 , Committing = 2, Committed = 3 , Cancelled = -1 }
 
 struct Descriptor<T: std::clone::Clone> {
@@ -117,6 +116,16 @@ impl <T: std::clone::Clone> Descriptor<T> {
         self.operations.push( 
             CAS {index: index, old: old, new: new}
         );
+    }
+
+    fn complete(&self) -> bool {
+        self.state == State::Reading ||
+        self.state == State::Cancelled ||
+        self.state == State::Committed
+    }
+
+    fn committed(&self) -> bool {
+        self.state == State::Committed
     }
 
     fn tagged_ptr(&self) -> *mut T {
@@ -159,7 +168,6 @@ impl <T: std::clone::Clone> Descriptor<T> {
                 if x.old == fake {
                     let result = vec.compare_and_swap(x.index, fake, ptr::null_mut());
                     // check for success, or race
-                    // free / collect old values
                 }
             }
         }
@@ -300,13 +308,24 @@ impl<'a, T: std::clone::Clone> Drop for Transaction<'a, T> {
     fn drop(&mut self) {
         unsafe {
             let d = &mut *self.descriptor;
-            if d.state == State::Writing || d.state == State::Committing {
-                self.cancel();
+            if !d.complete() {
+                d.cancel(&self.vec);
             }
-            Box::from_raw(self.descriptor);
-            // if cancelled, empty new
-            // if committed, empty old
-            // else panic
+            let mut d = Box::from_raw(self.descriptor);
+            if d.committed() {
+                for op in &d.operations {
+                    if !op.old.is_null() && !Descriptor::is_tagged(op.old) {
+                        Box::from_raw(op.old);
+                    }
+                }
+            } else {
+                for op in &d.operations {
+                    if !op.new.is_null() && !Descriptor::is_tagged(op.new) {
+                        Box::from_raw(op.new);
+                    }
+                }
+
+            }
         }
     }
 }
