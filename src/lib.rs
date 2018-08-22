@@ -47,6 +47,9 @@ impl <T> AtomicPtrVec<T> {
         }
     }
     pub fn load(&self, index: usize) -> *mut T {
+        if index >= self.len.load(Ordering::SeqCst) {
+            panic!("out of bounds");
+        }
         unsafe {
             let ptr = &*self.ptr.offset(index as isize);
             ptr.load(Ordering::SeqCst)
@@ -70,7 +73,7 @@ impl <T> AtomicPtrVec<T> {
             }
         }
     }
-    // as_mut_slice() instead
+    // XXX as_mut_slice() instead
     pub unsafe fn to_vec(&mut self) -> Vec<*mut T> {
         let v = Vec::from_raw_parts(self.ptr, self.len.load(Ordering::SeqCst), self.cap);
         mem::transmute(v)
@@ -84,7 +87,7 @@ struct CAS<T> {index: usize, old: *mut T, new: *mut T}
 enum State { Reading = 0, Writing = 1 , Committing = 2, Committed = 3 , Cancelled = -1 }
 
 struct Descriptor<T> {
-    state: State, // Make Atomic
+    state: State, // XXX Make Atomic
     operations: Vec<CAS<T>>,
 }
 
@@ -103,7 +106,7 @@ impl <T> Descriptor<T> {
     }
 }
 
-pub struct Transaction<'a, P: 'a> {
+pub struct Transaction<'a, P: 'a + std::clone::Clone> {
     vec: &'a AtomicPtrVec<P>,
     epoch: usize,
     descriptor: *mut Descriptor<P>,
@@ -119,17 +122,15 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
           
     pub fn read(&mut self, address:Address) -> Option<&'a P> {
         let ptr = self.vec.load(address);
-        // check for fake record, race ...
-        // check for null pointer, panic
+        // XXX check for fake record, race ...
+        // XXX check for null pointer, panic
         unsafe { Some(&*ptr) }
-        // Ref {ptr: ptr, _marker: PhantomData}
     }
 
     pub fn copy(&mut self, address:Address) -> Option<Box<P>> {
-        // same as read, but copying instead of borrowing
         let ptr = self.vec.load(address);
-        // check for fake record, race ...
-        // check for null pointer, panic
+        // XXX check for fake record, race ...
+        // XXX check for null pointer, panic
         unsafe { Some(Box::new((*ptr).clone())) }
     }
 
@@ -163,19 +164,21 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
 
     pub fn delete(&mut self, address: Address) {
         let old = self.vec.load(address);
-        unsafe {
-            let d = &mut *self.descriptor;
-            if d.state != State::Reading && d.state != State::Writing {
-                panic!("welp");
-            }
-            d.state = State::Writing;
-            d.add(address, old, ptr::null_mut());
+        if !old.is_null() {
+            unsafe {
+                let d = &mut *self.descriptor;
+                if d.state != State::Reading && d.state != State::Writing {
+                    panic!("welp");
+                }
+                d.state = State::Writing;
+                d.add(address, old, ptr::null_mut());
+            } 
         }
     }
     pub fn overwrite(&mut self, address:Address, value:P) {
         let ptr = Box::into_raw(Box::new(value));
         let old = self.vec.load(address);
-        // check descriptor
+        // XXX check descriptor
         unsafe {
             let d = &mut *self.descriptor;
             if d.state != State::Reading && d.state != State::Writing {
@@ -226,19 +229,19 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
                     if x.old != fake {
                         print!("new\n");
                         let result = self.vec.compare_and_swap(x.index, x.old, x.new);
-                        // check for success, or race
+                        // XXX check for success, or race
                     }
                 }
                 for x in &d.operations {
                     print!("replace\n");
                     let result = self.vec.compare_and_swap(x.index, x.old, x.new);
-                    // check for success, or race
+                    // XXX check for success, or race
                 }
             }
             d.state = State::Committed;
-            // free / collect old values
+            // XXX free / collect old values
+            d.state == State::Committed
         }
-        true
     }
 
     pub fn cancel(&mut self) {
@@ -264,10 +267,15 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
 
 }
 
-impl<'a, T> Drop for Transaction<'a, T> {
+impl<'a, T: std::clone::Clone> Drop for Transaction<'a, T> {
     fn drop(&mut self) {
-        // if !apply, cancel
-        unsafe { Box::from_raw(self.descriptor) };
+        unsafe {
+            let d = &mut *self.descriptor;
+            if d.state == State::Writing || d.state == State::Committing {
+                self.cancel();
+            }
+            Box::from_raw(self.descriptor);
+        }
     }
 }
 
@@ -277,13 +285,13 @@ struct Delete<P> {
     value: *mut P,
 }
 
-pub struct Collector<'a, P: 'a> {
+pub struct Collector<'a, P: 'a + std::clone::Clone> {
     heap: &'a AtomicHeap<P>,
     delete: Vec<Delete<P>>, // ArcMutex
     // read_set
 } 
 
-impl <'a, P> Collector<'a, P> {
+impl <'a, P: std::clone::Clone> Collector<'a, P> {
     fn collect_later(&mut self, epoch: usize, address: Address, value: *mut P) {
         self.delete.push(Delete{epoch: epoch, address: address, value: value});
     }
@@ -293,14 +301,14 @@ impl <'a, P> Collector<'a, P> {
 
 }
 
-impl<'a, T> Drop for Collector<'a, T> {
+impl<'a, T: std::clone::Clone> Drop for Collector<'a, T> {
     fn drop(&mut self) {
         // spin and collect ?
         ;
     }
 }
 
-pub struct AtomicHeap<P> {
+pub struct AtomicHeap<P: std::clone::Clone> {
     vec: AtomicPtrVec<P>,
     epoch: AtomicUsize,
 }
@@ -335,7 +343,7 @@ impl <P: std::clone::Clone> AtomicHeap<P> {
 
 }
 
-impl<T> Drop for AtomicHeap<T> {
+impl<T: std::clone::Clone> Drop for AtomicHeap<T> {
     fn drop(&mut self) {
         let v = unsafe { self.vec.to_vec() };
         for i in v {
@@ -382,8 +390,21 @@ mod tests {
             txn.apply();
         }
         {
-            let mut txn2 = h.transaction(&mut s);
-            let o = txn2.read(addr).unwrap();
+            let mut txn = h.transaction(&mut s);
+            let o = txn.read(addr).unwrap();
+            print!("read: {}\n", o);
+        }
+        {
+            let mut txn = h.transaction(&mut s);
+            let old = txn.read(addr).unwrap();
+            let mut o = Box::new(old.clone());
+            o.push_str(" mutated");
+            txn.update(addr, old, o);
+            txn.apply();
+        }
+        {
+            let mut txn = h.transaction(&mut s);
+            let o = txn.read(addr).unwrap();
             print!("read: {}\n", o);
         }
         s.collect();
