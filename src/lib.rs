@@ -13,9 +13,12 @@ use std::clone::Clone;
 
 
 // todo: make Descriptor use atomic state
-//       make apply, cancel dispose of new/old items
-//       check for descriptor in load 
+//       conflicted state
+//       make txn drop dispose of new/old items
 //       Descriptor::race()
+//       collector free list
+//       heap free list
+//       epoch advancement
 
 type Address = usize;
 
@@ -163,9 +166,12 @@ impl <T: std::clone::Clone> Descriptor<T> {
         self.state = State::Cancelled;
     }
 
-    pub fn is_tagged(ptr: *mut T) -> bool {
+    fn is_tagged(ptr: *mut T) -> bool {
         let ptr: usize = unsafe{mem::transmute(ptr)};
         ptr & 1 == 1
+    }
+    fn race(me: *mut Descriptor<T>, other: *mut Descriptor<T>) {
+        // XXX
     }
 }
 
@@ -192,6 +198,12 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
             ptr = self.vec.load(address);
             if !Descriptor::is_tagged(ptr) {
                 flag = false;
+            } else {
+                unsafe {
+                    let ptr: usize = mem::transmute(ptr);
+                    let ptr: *mut Descriptor<P> = mem::transmute(ptr & (!1 as usize));
+                    Descriptor::race(self.descriptor, ptr)
+                }
             }
         }
         ptr
