@@ -15,6 +15,7 @@ use std::clone::Clone;
 // todo: make Descriptor use atomic state
 //       make apply, cancel dispose of new/old items
 //       check for descriptor in load 
+//       Descriptor::race()
 
 type Address = usize;
 
@@ -161,6 +162,11 @@ impl <T: std::clone::Clone> Descriptor<T> {
         }
         self.state = State::Cancelled;
     }
+
+    pub fn is_tagged(ptr: *mut T) -> bool {
+        let ptr: usize = unsafe{mem::transmute(ptr)};
+        ptr & 1 == 1
+    }
 }
 
 pub struct Transaction<'a, P: 'a + std::clone::Clone> {
@@ -178,14 +184,22 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
     pub fn cancel(&mut self) {
         unsafe { (&mut *self.descriptor).cancel(&self.vec) }
     }
-    pub fn is_tagged(ptr: *mut P) -> bool {
-        let ptr: usize = unsafe{mem::transmute(ptr)};
-        ptr & 1 == 1
+
+    fn load(&mut self, address: Address) -> *mut P {
+        let mut flag = true;
+        let mut ptr: *mut P = ptr::null_mut();
+        while flag {
+            ptr = self.vec.load(address);
+            if !Descriptor::is_tagged(ptr) {
+                flag = false;
+            }
+        }
+        ptr
     }
           
     pub fn read(&mut self, address:Address) -> Option<&'a P> {
-        let ptr = self.vec.load(address);
-        if ptr.is_null() || Transaction::is_tagged(ptr) {
+        let ptr = self.load(address);
+        if ptr.is_null() || Descriptor::is_tagged(ptr) {
             None
         } else {
             unsafe { Some(&*ptr) }
@@ -193,8 +207,8 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
     }
 
     pub fn copy(&mut self, address:Address) -> Option<Box<P>> {
-        let ptr = self.vec.load(address);
-        if ptr.is_null() || Transaction::is_tagged(ptr) {
+        let ptr = self.load(address);
+        if ptr.is_null() || Descriptor::is_tagged(ptr) {
             None
         } else {
             unsafe { Some(Box::new((*ptr).clone())) }
@@ -221,44 +235,41 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
     }
     
 
-    pub fn delete(&mut self, address: Address) -> bool {
-        let old = self.vec.load(address);
-        if old.is_null() || Transaction::is_tagged(old) {
-            false
-        } else {
+    pub fn delete(&mut self, address: Address) {
+        let old = self.load(address);
+        if Descriptor::is_tagged(old) {
+            panic!("conflict")
+        } else if !old.is_null() {
             unsafe {
                 let d = &mut *self.descriptor;
                 d.add(address, old, ptr::null_mut());
             } 
-            true
         }
     }
 
-    pub fn overwrite(&mut self, address:Address, value:P) -> bool {
+    pub fn overwrite(&mut self, address:Address, value:P) {
         let ptr = Box::into_raw(Box::new(value));
-        let old = self.vec.load(address);
-        if Transaction::is_tagged(old) {
-            false
+        let old = self.load(address);
+        if Descriptor::is_tagged(old) {
+            panic!("conflict")
         } else {
-            // XXX check descriptor
             unsafe {
                 let d = &mut *self.descriptor;
                 d.add(address, old, ptr);
             }
-            true
         }
     }
 
 
     pub fn upsert<U: Fn(&mut P)>(&mut self, address: Address, value: Box<P>, on_conflict: U) {
-        let old = self.vec.load(address);
+        let old = self.load(address);
         if old.is_null() {
             let ptr = Box::into_raw(value);
             unsafe {
                 let d = &mut *self.descriptor;
                 d.add(address, ptr::null_mut(), ptr);
             }
-        } else { 
+        } else if !Descriptor::is_tagged(old) { 
             let mut b = unsafe { Box::new( (*old).clone() ) };
             on_conflict(&mut b);
             let ptr = Box::into_raw(b);
@@ -266,6 +277,8 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
                 let d = &mut *self.descriptor;
                 d.add(address, old, ptr);
             }
+        } else {
+            panic!("conflict");
         }
     }
 
