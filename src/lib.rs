@@ -11,6 +11,11 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::clone::Clone;
 
+
+// todo: make Descriptor use atomic state
+//       make apply, cancel dispose of new/old items
+//       check for descriptor in load 
+
 type Address = usize;
 
 struct AtomicPtrVec<T> {
@@ -86,12 +91,12 @@ struct CAS<T> {index: usize, old: *mut T, new: *mut T}
 #[derive(PartialEq)]
 enum State { Reading = 0, Writing = 1 , Committing = 2, Committed = 3 , Cancelled = -1 }
 
-struct Descriptor<T> {
+struct Descriptor<T: std::clone::Clone> {
     state: State, // XXX Make Atomic
     operations: Vec<CAS<T>>,
 }
 
-impl <T> Descriptor<T> {
+impl <T: std::clone::Clone> Descriptor<T> {
     fn new() -> Descriptor<T> {
         let mut vec = Vec::with_capacity(8);
         Descriptor {
@@ -104,6 +109,53 @@ impl <T> Descriptor<T> {
             CAS {index: index, old: old, new: new}
         );
     }
+
+    fn tagged_ptr(&self) -> *mut T {
+        let ptr: *mut Descriptor<T> = unsafe { mem::transmute(self) };
+        let ptr: usize = unsafe { mem::transmute(ptr) };
+        let ptr = ptr | 1;
+        unsafe{mem::transmute(ptr)}
+    }
+
+    fn apply(&mut self, vec: &AtomicPtrVec<T>) -> bool {
+        if self.state == State::Committing || self.state == State::Cancelled {
+            panic!("welp");
+        }
+        if self.state == State::Writing {
+            let fake = self.tagged_ptr();
+            for x in &self.operations {
+                if x.old != fake {
+                    print!("new\n");
+                    let result = vec.compare_and_swap(x.index, x.old, x.new);
+                    // XXX check for success, or race
+                }
+            }
+            for x in &self.operations {
+                print!("replace\n");
+                let result = vec.compare_and_swap(x.index, x.old, x.new);
+                // XXX check for success, or race
+            }
+            self.state = State::Committed;
+        }
+        self.state == State::Committed
+    }
+
+    fn cancel(&mut self, vec: &AtomicPtrVec<T>) {
+        if self.state == State::Committing || self.state == State::Cancelled {
+            panic!("welp");
+        }
+        if self.state == State::Writing {
+            let fake = self.tagged_ptr();
+            for x in &self.operations {
+                if x.old == fake {
+                    let result = vec.compare_and_swap(x.index, fake, ptr::null_mut());
+                    // check for success, or race
+                    // free / collect old values
+                }
+            }
+        }
+        self.state = State::Cancelled;
+    }
 }
 
 pub struct Transaction<'a, P: 'a + std::clone::Clone> {
@@ -114,10 +166,18 @@ pub struct Transaction<'a, P: 'a + std::clone::Clone> {
 }
 
 impl <'a, P: std::clone::Clone> Transaction<'a, P> {
-    fn fake_item(&self) -> *mut P {
-        let ptr: usize = unsafe { mem::transmute(self.descriptor) };
-        let ptr = ptr | 1;
-        unsafe{mem::transmute(self.descriptor)}
+    pub fn apply(&mut self) -> bool {
+        unsafe {
+            let d = &mut *self.descriptor;
+            d.apply(&self.vec)
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        unsafe {
+            let d = &mut *self.descriptor;
+            d.cancel(&self.vec)
+        }
     }
           
     pub fn read(&mut self, address:Address) -> Option<&'a P> {
@@ -147,18 +207,18 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
     }
     
     pub fn insert(&mut self, value: Box<P>) -> Address {
-        let ptr = Box::into_raw(value);
-        let fake = self.fake_item();
-        let addr = self.vec.append(fake).unwrap();
         unsafe {
             let d = &mut *self.descriptor;
             if d.state != State::Reading && d.state != State::Writing {
                 panic!("welp");
             }
+            let ptr = Box::into_raw(value);
+            let fake = d.tagged_ptr();
+            let addr = self.vec.append(fake).unwrap();
             d.state = State::Writing;
             d.add(addr, fake, ptr);
+            addr
         }
-        addr
     }
     
 
@@ -175,6 +235,7 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
             } 
         }
     }
+
     pub fn overwrite(&mut self, address:Address, value:P) {
         let ptr = Box::into_raw(Box::new(value));
         let old = self.vec.load(address);
@@ -217,54 +278,6 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
         }
     }
 
-    pub fn apply(&mut self) -> bool {
-        unsafe {
-            let d = &mut *self.descriptor;
-            if d.state == State::Committing || d.state == State::Cancelled {
-                panic!("welp");
-            }
-            if d.state == State::Writing {
-                let fake = self.fake_item();
-                for x in &d.operations {
-                    if x.old != fake {
-                        print!("new\n");
-                        let result = self.vec.compare_and_swap(x.index, x.old, x.new);
-                        // XXX check for success, or race
-                    }
-                }
-                for x in &d.operations {
-                    print!("replace\n");
-                    let result = self.vec.compare_and_swap(x.index, x.old, x.new);
-                    // XXX check for success, or race
-                }
-            }
-            d.state = State::Committed;
-            // XXX free / collect old values
-            d.state == State::Committed
-        }
-    }
-
-    pub fn cancel(&mut self) {
-        unsafe {
-            let d = &mut *self.descriptor;
-            // free inserted records
-            if d.state == State::Committing || d.state == State::Cancelled {
-                panic!("welp");
-            }
-            if d.state == State::Writing {
-                let fake = self.fake_item();
-                for x in &d.operations {
-                    if x.old == fake {
-                        let result = self.vec.compare_and_swap(x.index, fake, ptr::null_mut());
-                        // check for success, or race
-                        // free / collect old values
-                    }
-                }
-            }
-            d.state = State::Cancelled;
-        }
-    }
-
 }
 
 impl<'a, T: std::clone::Clone> Drop for Transaction<'a, T> {
@@ -275,6 +288,9 @@ impl<'a, T: std::clone::Clone> Drop for Transaction<'a, T> {
                 self.cancel();
             }
             Box::from_raw(self.descriptor);
+            // if cancelled, empty new
+            // if committed, empty old
+            // else panic
         }
     }
 }
