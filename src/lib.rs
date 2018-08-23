@@ -1,4 +1,3 @@
-// feature(nll)]
 #![allow(unused_imports,dead_code,unused_variables,unused_mut,unused_assignments)]
 
 use std::borrow::Borrow;
@@ -10,6 +9,7 @@ use std::ops::Deref;
 use std::fmt;
 use std::marker::PhantomData;
 use std::clone::Clone;
+use std::slice;
 
 
 // todo: make Descriptor use atomic state
@@ -82,9 +82,12 @@ impl <T> AtomicPtrVec<T> {
         }
     }
     // XXX as_mut_slice() instead
-    pub unsafe fn to_vec(&mut self) -> Vec<*mut T> {
-        let v = Vec::from_raw_parts(self.ptr, self.len.load(Ordering::SeqCst), self.cap);
-        mem::transmute(v)
+    pub fn as_slice(&mut self) -> &[*mut T] {
+        unsafe { 
+            let s = slice::from_raw_parts(self.ptr, self.len.load(Ordering::SeqCst));
+            let s: &[*mut T] = mem::transmute(s);
+            s
+        }
     }
 }
 
@@ -349,6 +352,15 @@ impl <'a, P: std::clone::Clone> Collector<'a, P> {
     pub fn collect(&mut self) {
         // read current epoch, scan list, prune
     }
+    pub fn transaction<'b>(&'b mut self) -> Transaction<'b, 'a, P> {
+        let d = Box::new(Descriptor::new());
+        Transaction {
+            vec: &self.heap.vec,
+            epoch: self.heap.current_epoch(),
+            descriptor: Box::into_raw(d),
+            collector: self,
+        } 
+    }
 
 }
 
@@ -397,10 +409,9 @@ impl <P: std::clone::Clone> AtomicHeap<P> {
 
 impl<T: std::clone::Clone> Drop for AtomicHeap<T> {
     fn drop(&mut self) {
-        let v = unsafe { self.vec.to_vec() };
-        for i in v {
+        for i in self.vec.as_slice() {
             if !i.is_null() {
-                unsafe { Box::from_raw(i) };
+                unsafe { Box::from_raw(*i) };
             }
         }
     }
@@ -424,6 +435,7 @@ impl <'a, T: fmt::Display> fmt::Display for Ref<'a, T> {
         fmt::Display::fmt(unsafe{&*self.ptr}, f)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use AtomicHeap;
@@ -437,17 +449,17 @@ mod tests {
         let mut s = h.collector();
         let mut addr = 0;
         {
-            let mut txn = h.transaction(&mut s);
+            let mut txn = s.transaction();
             addr = txn.insert(Box::new("example".to_string()));
             txn.apply();
         }
         {
-            let mut txn = h.transaction(&mut s);
+            let mut txn = s.transaction();
             let o = txn.read(addr).unwrap();
             print!("read: {}\n", o);
         }
         {
-            let mut txn = h.transaction(&mut s);
+            let mut txn = s.transaction();
             let old = txn.read(addr).unwrap();
             let mut o = Box::new(old.clone());
             o.push_str(" mutated");
@@ -455,7 +467,7 @@ mod tests {
             txn.apply();
         }
         {
-            let mut txn = h.transaction(&mut s);
+            let mut txn = s.transaction();
             let o = txn.read(addr).unwrap();
             print!("read: {}\n", o);
         }
