@@ -367,6 +367,7 @@ impl Collector {
 
 pub struct Session<'a, P: 'a + std::clone::Clone> {
     heap: &'a Heap<P>,
+    collector: &'a Collector,
     delete: Vec<Delete<P>>, 
     state: SessionState,
     clear: bool,
@@ -491,7 +492,13 @@ impl <P: std::clone::Clone> Heap<P> {
 
     pub fn session<'a>(&'a self) -> Session<'a, P> {
         let v = Vec::with_capacity(20);
-        Session {heap:self, delete: v, state: SessionState::Inactive, clear: true}
+        Session {
+            heap:self, 
+            collector: &self.collector,
+            delete: v, 
+            state: SessionState::Inactive, 
+            clear: true
+        }
     }
     pub fn transaction<'a, 'b>(&'a self, session: &'a mut Session<'b, P>) -> Transaction<'a, 'b, P> {
         self.collect();
