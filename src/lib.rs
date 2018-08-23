@@ -201,6 +201,16 @@ pub struct Transaction<'a, 'b: 'a, P: 'a + 'b + std::clone::Clone> {
 }
 
 impl <'a, 'b, P: std::clone::Clone> Transaction<'a, 'b, P> {
+    fn new(heap: &'a Heap<P>, session: &'a mut Session<'b, P>) -> Transaction<'a, 'b, P> {
+        heap.collect();
+        let d = Box::new(Descriptor::new());
+        unsafe {session.enter_critical()};
+        Transaction {
+            vec: &heap.vec,
+            descriptor: Box::into_raw(d),
+            session: session,
+        } 
+    }
     pub fn apply(&mut self) -> bool {
         unsafe { (&mut *self.descriptor).apply(&self.vec) }
     }
@@ -374,6 +384,16 @@ pub struct Session<'a, P: 'a + std::clone::Clone> {
 } 
 
 impl <'a, P: std::clone::Clone> Session<'a, P> {
+    fn new(heap: &'a Heap<P>) -> Session<'a, P> {
+        let v = Vec::with_capacity(20);
+        Session {
+            heap: heap, 
+            collector: &heap.collector,
+            delete: v, 
+            state: SessionState::Inactive, 
+            clear: true,
+        }
+    }
     unsafe fn enter_critical(&mut self) {
         if self.state == SessionState::Inactive {
             self.state = self.heap.enter_session();
@@ -401,7 +421,7 @@ impl <'a, P: std::clone::Clone> Session<'a, P> {
         }
     }
     pub fn transaction<'b>(&'b mut self) -> Transaction<'b, 'a, P> {
-        self.heap.transaction(self)
+        Transaction::new(self.heap, self)
     }
 
 }
@@ -491,24 +511,10 @@ impl <P: std::clone::Clone> Heap<P> {
     }
 
     pub fn session<'a>(&'a self) -> Session<'a, P> {
-        let v = Vec::with_capacity(20);
-        Session {
-            heap:self, 
-            collector: &self.collector,
-            delete: v, 
-            state: SessionState::Inactive, 
-            clear: true
-        }
+        Session::new(self)
     }
     pub fn transaction<'a, 'b>(&'a self, session: &'a mut Session<'b, P>) -> Transaction<'a, 'b, P> {
-        self.collect();
-        let d = Box::new(Descriptor::new());
-        unsafe {session.enter_critical()};
-        Transaction {
-            vec: &self.vec,
-            descriptor: Box::into_raw(d),
-            session: session,
-        } 
+        Transaction::new(self, session)
     }
 
 }
