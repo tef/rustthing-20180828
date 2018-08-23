@@ -13,20 +13,22 @@ use std::slice;
 
 
 // todo
-//      epoch/quiecent collector
+//      collector has 
 //      refcount of active/quiet sessions + increment epoch when matching
 //
 //      descriptor uses atomicusize for state
 //      add conflicted state, auto cancels, maybe Result<>/bool?
 //      Descriptor::race()
 //
-//      atomicPtrVec push/pop left      
-//      insert uses free list of deleted entries
-//      one in session, one in heap
-//      heap has global free list
+//      global free list is atomicdeque 
+//          with push/pop left      
+//      insert uses list of empty addresses
+//            one in session, one in heap
 //
 //      inline
 //      tests
+//
+//      trie?
 
 type Address = usize;
 
@@ -391,24 +393,41 @@ pub struct Session<'a, P: 'a + std::clone::Clone> {
     delete: Option<Vec<Delete<P>>>, 
     state: SessionState,
     clear: bool,
+    behaviour: SessionBehaviour,
 } 
 
+#[derive(PartialEq)]
+enum SessionBehaviour {
+    ClearOnExit, CloseOnExit, ClearOnExitCloseOnDelete
+}
+
 impl <'a, P: std::clone::Clone> Session<'a, P> {
-    fn new(heap: &'a Heap<P>) -> Session<'a, P> {
+    fn new(heap: &'a Heap<P>, behaviour: SessionBehaviour) -> Session<'a, P> {
+        let c: bool = match behaviour {
+            SessionBehaviour::ClearOnExit => true,
+            SessionBehaviour::CloseOnExit => false,
+            SessionBehaviour::ClearOnExitCloseOnDelete => true,
+        };
         let v = Vec::with_capacity(20);
         Session {
             heap: heap, 
             collector: &heap.collector,
             delete: Some(v), 
             state: SessionState::Inactive, 
-            clear: true,
+            clear: c,
+            behaviour: behaviour,
         }
     }
     unsafe fn enter_critical(&mut self) {
         self.collect();
+        let c: bool = match self.behaviour {
+            SessionBehaviour::ClearOnExit => true,
+            SessionBehaviour::CloseOnExit => false,
+            SessionBehaviour::ClearOnExitCloseOnDelete => true,
+        };
         if self.state == SessionState::Inactive {
             self.state = self.collector.enter_session();
-            self.clear = true;
+            self.clear = c;
         }
     }
     unsafe fn exit_critical(&mut self) {
@@ -421,13 +440,16 @@ impl <'a, P: std::clone::Clone> Session<'a, P> {
     }
 
     unsafe fn collect_later(&mut self, epoch: usize, address: Address, value: *mut P) {
-        self.clear = false;
+        if self.behaviour == SessionBehaviour::ClearOnExitCloseOnDelete {
+            self.clear = false;
+        }
         self.delete.as_mut().unwrap().push(Delete{epoch: epoch, address: address, value: value});
     }
 
     pub fn collect(&mut self) {
         self.heap.collect();
         let epoch = self.collector.current_epoch();
+        // XXX
         // peek at vec, clean any that are done
         // for x in delete, delete if epoch-2 ...
     }
@@ -526,7 +548,7 @@ impl <P: std::clone::Clone> Heap<P> {
     }
 
     pub fn session<'a>(&'a self) -> Session<'a, P> {
-        Session::new(self)
+        Session::new(self, SessionBehaviour::ClearOnExit)
     }
 
     fn epoch(&self) -> usize {
@@ -541,6 +563,7 @@ impl <P: std::clone::Clone> Heap<P> {
     pub fn collect(&self) {
         let epoch = self.collector.advance();
         // check for free list
+        // XXX
     }
 
 }
