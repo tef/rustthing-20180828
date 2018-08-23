@@ -15,7 +15,7 @@ use std::slice;
 // todo: make Descriptor use atomic state
 //       conflicted state
 //       Descriptor::race()
-//       collector free list
+//       session free list
 //       heap free list
 //       epoch advancement
 
@@ -190,7 +190,7 @@ pub struct Transaction<'a, 'b: 'a, P: 'a + 'b + std::clone::Clone> {
     vec: &'a AtomicPtrVec<P>,
     epoch: usize,
     descriptor: *mut Descriptor<P>,
-    collector: &'a mut Collector<'b, P>,
+    session: &'a mut Session<'b, P>,
 }
 
 impl <'a, 'b, P: std::clone::Clone> Transaction<'a, 'b, P> {
@@ -318,7 +318,7 @@ impl<'a, 'b, T: std::clone::Clone> Drop for Transaction<'a, 'b, T> {
             if d.committed() {
                 for op in &d.operations {
                     if !op.old.is_null() && !Descriptor::is_tagged(op.old) {
-                        self.collector.collect_later(self.epoch, op.index, op.old);
+                        self.session.collect_later(self.epoch, op.index, op.old);
                     }
                 }
             } else {
@@ -339,13 +339,13 @@ struct Delete<P> {
     value: *mut P,
 }
 
-pub struct Collector<'a, P: 'a + std::clone::Clone> {
+pub struct Session<'a, P: 'a + std::clone::Clone> {
     heap: &'a AtomicHeap<P>,
     delete: Vec<Delete<P>>, // ArcMutex
     // read_set
 } 
 
-impl <'a, P: std::clone::Clone> Collector<'a, P> {
+impl <'a, P: std::clone::Clone> Session<'a, P> {
     fn collect_later(&mut self, epoch: usize, address: Address, value: *mut P) {
         self.delete.push(Delete{epoch: epoch, address: address, value: value});
     }
@@ -358,13 +358,13 @@ impl <'a, P: std::clone::Clone> Collector<'a, P> {
             vec: &self.heap.vec,
             epoch: self.heap.current_epoch(),
             descriptor: Box::into_raw(d),
-            collector: self,
+            session: self,
         } 
     }
 
 }
 
-impl<'a, T: std::clone::Clone> Drop for Collector<'a, T> {
+impl<'a, T: std::clone::Clone> Drop for Session<'a, T> {
     fn drop(&mut self) {
         // spin and collect ?
         // push onto heap's shared list
@@ -391,17 +391,17 @@ impl <P: std::clone::Clone> AtomicHeap<P> {
         self.epoch.load(Ordering::SeqCst)
     }
 
-    pub fn collector<'a>(&'a self) -> Collector<'a, P> {
+    pub fn session<'a>(&'a self) -> Session<'a, P> {
         let v = Vec::with_capacity(20);
-        Collector {heap:self, delete: v}
+        Session {heap:self, delete: v}
     }
-    pub fn transaction<'a, 'b>(&'a self, collector: &'a mut Collector<'b, P>) -> Transaction<'a, 'b, P> {
+    pub fn transaction<'a, 'b>(&'a self, session: &'a mut Session<'b, P>) -> Transaction<'a, 'b, P> {
         let d = Box::new(Descriptor::new());
         Transaction {
             vec: &self.vec,
             epoch: self.current_epoch(),
             descriptor: Box::into_raw(d),
-            collector: collector,
+            session: session,
         } 
     }
 
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn it_works() {
         let h = Arc::new(AtomicHeap::new(1024));
-        let mut s = h.collector();
+        let mut s = h.session();
         let mut addr = 0;
         {
             let mut txn = s.transaction();
