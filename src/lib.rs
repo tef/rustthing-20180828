@@ -23,6 +23,10 @@ use std::slice;
 //
 //      insert uses free list of deleted entries
 //      one in session, one in heap
+//
+//      atomicPtrVec push/pop left      
+//      inline
+//      tests
 
 type Address = usize;
 
@@ -343,28 +347,52 @@ struct Delete<P> {
     value: *mut P,
 }
 
+#[derive(PartialEq)]
+enum SessionState {
+    Inactive,
+    Active,
+    Quiet(usize),
+}
+
+struct Collector {
+    epoch: AtomicUsize
+}
+
+impl Collector {
+    fn current_epoch(&self) -> usize {
+        self.epoch.load(Ordering::SeqCst)
+    }
+}
+
+
 pub struct Session<'a, P: 'a + std::clone::Clone> {
     heap: &'a Heap<P>,
     delete: Vec<Delete<P>>, 
-    active: bool,
+    state: SessionState,
+    clear: bool,
 } 
 
 impl <'a, P: std::clone::Clone> Session<'a, P> {
     unsafe fn enter_critical(&mut self) {
-        if !self.active {
-            self.heap.enter_session();
-            self.active = true;
+        if self.state == SessionState::Inactive {
+            self.state = self.heap.enter_session();
+            self.clear = true;
         }
     }
     unsafe fn exit_critical(&mut self) {
-        // if epoch has advanced!
-        self.heap.clear_session(); 
+        if self.clear {
+            self.state = self.heap.clear_session(&self.state);
+        } else {
+            self.state = self.heap.exit_session(&self.state);
+        }
     }
 
     unsafe fn collect_later(&mut self, address: Address, value: *mut P) {
         let epoch = self.heap.epoch();
+        self.clear = false;
         self.delete.push(Delete{epoch: epoch, address: address, value: value});
     }
+
     pub fn collect(&mut self) {
         // for x in delete, delete if epoch-2 ...
         for d in self.delete.drain(0..) {
@@ -383,24 +411,16 @@ impl<'a, T: std::clone::Clone> Drop for Session<'a, T> {
             self.heap.collect_later(d.epoch, d.address, d.value);
         }
         unsafe {
-            self.heap.clear_session();
-            self.heap.exit_session();
+            if self.state != SessionState::Inactive {
+                self.heap.exit_session(&self.state);
+            }
         }
-    }
-}
-
-struct Barrier {
-    epoch: AtomicUsize
-}
-impl Barrier {
-    fn current_epoch(&self) -> usize {
-        self.epoch.load(Ordering::SeqCst)
     }
 }
 
 pub struct Heap<P: std::clone::Clone> {
     vec: AtomicPtrVec<P>,
-    barrier: Barrier,
+    collector: Collector,
 }
 
 impl <P: std::clone::Clone> Heap<P> {
@@ -409,24 +429,50 @@ impl <P: std::clone::Clone> Heap<P> {
         let e = AtomicUsize::new(0);
         Heap {
             vec: t,
-            barrier: Barrier { epoch:e, },
+            collector: Collector { epoch:e, },
         }
     }
 
-    unsafe fn enter_session(&self) {
+    unsafe fn enter_session(&self) -> SessionState {
         // incr active
+        return SessionState::Active
     }
 
-    unsafe fn clear_session(&self) {
-        // incr quiet
+    unsafe fn clear_session(&self, state: &SessionState) -> SessionState{
+        let epoch = self.epoch();
+        match state {
+            SessionState::Inactive => panic!{"sync!"},
+            SessionState::Active => {
+                // incr quiet
+                
+            },
+            SessionState::Quiet(e) => {
+                if *e != epoch {
+                  //  incr quiet
+                }
+            }
+        };
+        SessionState::Quiet(epoch)
     }
 
-    unsafe fn exit_session(&self) {
+    unsafe fn exit_session(&self, state: &SessionState) -> SessionState {
+        match state {
+            SessionState::Inactive => {},
+            SessionState::Active => {
+                // decr active
+                
+            },
+            SessionState::Quiet(e) =>  {
+                //decr quiet 
+            }
+        };
         // decr active
+        SessionState::Inactive
+        // check if currently active, etc
     }
 
     fn epoch(&self) -> usize {
-        self.barrier.current_epoch()
+        self.collector.current_epoch()
     }
 
     fn advance(&self) -> usize {
@@ -445,7 +491,7 @@ impl <P: std::clone::Clone> Heap<P> {
 
     pub fn session<'a>(&'a self) -> Session<'a, P> {
         let v = Vec::with_capacity(20);
-        Session {heap:self, delete: v, active: false}
+        Session {heap:self, delete: v, state: SessionState::Inactive, clear: true}
     }
     pub fn transaction<'a, 'b>(&'a self, session: &'a mut Session<'b, P>) -> Transaction<'a, 'b, P> {
         self.collect();
@@ -462,6 +508,9 @@ impl <P: std::clone::Clone> Heap<P> {
 
 impl<T: std::clone::Clone> Drop for Heap<T> {
     fn drop(&mut self) {
+        self.advance();
+        self.advance();
+        self.collect();
         for i in self.vec.as_slice() {
             if !i.is_null() {
                 unsafe { Box::from_raw(*i) };
