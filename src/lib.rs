@@ -372,95 +372,13 @@ impl Collector {
     fn current_epoch(&self) -> usize {
         self.epoch.load(Ordering::SeqCst)
     }
-}
-
-
-pub struct Session<'a, P: 'a + std::clone::Clone> {
-    heap: &'a Heap<P>,
-    collector: &'a Collector,
-    delete: Vec<Delete<P>>, 
-    state: SessionState,
-    clear: bool,
-} 
-
-impl <'a, P: std::clone::Clone> Session<'a, P> {
-    fn new(heap: &'a Heap<P>) -> Session<'a, P> {
-        let v = Vec::with_capacity(20);
-        Session {
-            heap: heap, 
-            collector: &heap.collector,
-            delete: v, 
-            state: SessionState::Inactive, 
-            clear: true,
-        }
-    }
-    unsafe fn enter_critical(&mut self) {
-        if self.state == SessionState::Inactive {
-            self.state = self.heap.enter_session();
-            self.clear = true;
-        }
-    }
-    unsafe fn exit_critical(&mut self) {
-        if self.clear {
-            self.state = self.heap.clear_session(&self.state);
-        } else {
-            self.state = self.heap.exit_session(&self.state);
-        }
-    }
-
-    unsafe fn collect_later(&mut self, address: Address, value: *mut P) {
-        let epoch = self.heap.epoch();
-        self.clear = false;
-        self.delete.push(Delete{epoch: epoch, address: address, value: value});
-    }
-
-    pub fn collect(&mut self) {
-        // for x in delete, delete if epoch-2 ...
-        for d in self.delete.drain(0..) {
-            self.heap.collect_later(d.epoch, d.address, d.value);
-        }
-    }
-    pub fn transaction<'b>(&'b mut self) -> Transaction<'b, 'a, P> {
-        Transaction::new(self.heap, self)
-    }
-
-}
-
-impl<'a, T: std::clone::Clone> Drop for Session<'a, T> {
-    fn drop(&mut self) {
-        for d in self.delete.drain(0..) {
-            self.heap.collect_later(d.epoch, d.address, d.value);
-        }
-        unsafe {
-            if self.state != SessionState::Inactive {
-                self.heap.exit_session(&self.state);
-            }
-        }
-    }
-}
-
-pub struct Heap<P: std::clone::Clone> {
-    vec: AtomicPtrVec<P>,
-    collector: Collector,
-}
-
-impl <P: std::clone::Clone> Heap<P> {
-    pub fn new(capacity: usize) -> Heap<P> {
-        let t = AtomicPtrVec::new(capacity);
-        let e = AtomicUsize::new(0);
-        Heap {
-            vec: t,
-            collector: Collector { epoch:e, },
-        }
-    }
-
     unsafe fn enter_session(&self) -> SessionState {
         // incr active
         return SessionState::Active
     }
 
     unsafe fn clear_session(&self, state: &SessionState) -> SessionState{
-        let epoch = self.epoch();
+        let epoch = self.current_epoch();
         match state {
             SessionState::Inactive => panic!{"sync!"},
             SessionState::Active => {
@@ -492,13 +410,90 @@ impl <P: std::clone::Clone> Heap<P> {
         // check if currently active, etc
     }
 
-    fn epoch(&self) -> usize {
-        self.collector.current_epoch()
+}
+
+
+pub struct Session<'a, P: 'a + std::clone::Clone> {
+    heap: &'a Heap<P>,
+    collector: &'a Collector,
+    delete: Vec<Delete<P>>, 
+    state: SessionState,
+    clear: bool,
+} 
+
+impl <'a, P: std::clone::Clone> Session<'a, P> {
+    fn new(heap: &'a Heap<P>) -> Session<'a, P> {
+        let v = Vec::with_capacity(20);
+        Session {
+            heap: heap, 
+            collector: &heap.collector,
+            delete: v, 
+            state: SessionState::Inactive, 
+            clear: true,
+        }
+    }
+    unsafe fn enter_critical(&mut self) {
+        if self.state == SessionState::Inactive {
+            self.state = self.collector.enter_session();
+            self.clear = true;
+        }
+    }
+    unsafe fn exit_critical(&mut self) {
+        if self.clear {
+            self.state = self.collector.clear_session(&self.state);
+        } else {
+            self.state = self.collector.exit_session(&self.state);
+        }
     }
 
-    fn advance(&self) -> usize {
-        // check active == quiet and epoch +=1
-        self.epoch()
+    unsafe fn collect_later(&mut self, address: Address, value: *mut P) {
+        let epoch = self.collector.current_epoch();
+        self.clear = false;
+        self.delete.push(Delete{epoch: epoch, address: address, value: value});
+    }
+
+    pub fn collect(&mut self) {
+        // for x in delete, delete if epoch-2 ...
+        for d in self.delete.drain(0..) {
+            self.heap.collect_later(d.epoch, d.address, d.value);
+        }
+    }
+    pub fn transaction<'b>(&'b mut self) -> Transaction<'b, 'a, P> {
+        Transaction::new(self.heap, self)
+    }
+
+}
+
+impl<'a, T: std::clone::Clone> Drop for Session<'a, T> {
+    fn drop(&mut self) {
+        for d in self.delete.drain(0..) {
+            self.heap.collect_later(d.epoch, d.address, d.value);
+        }
+        unsafe {
+            if self.state != SessionState::Inactive {
+                self.collector.exit_session(&self.state);
+            }
+        }
+    }
+}
+
+pub struct Heap<P: std::clone::Clone> {
+    vec: AtomicPtrVec<P>,
+    collector: Collector,
+}
+
+impl <P: std::clone::Clone> Heap<P> {
+    pub fn new(capacity: usize) -> Heap<P> {
+        let t = AtomicPtrVec::new(capacity);
+        let e = AtomicUsize::new(0);
+        Heap {
+            vec: t,
+            collector: Collector { epoch:e, },
+        }
+    }
+
+    fn epoch(&self) -> usize {
+        self.collector.current_epoch()
     }
 
     fn collect_later(&self, epoch: usize, address: Address, value: *mut P) {
@@ -506,24 +501,17 @@ impl <P: std::clone::Clone> Heap<P> {
     }
 
     pub fn collect(&self) {
-        self.advance();
         // check for free list
     }
 
     pub fn session<'a>(&'a self) -> Session<'a, P> {
         Session::new(self)
     }
-    pub fn transaction<'a, 'b>(&'a self, session: &'a mut Session<'b, P>) -> Transaction<'a, 'b, P> {
-        Transaction::new(self, session)
-    }
-
 }
 
 impl<T: std::clone::Clone> Drop for Heap<T> {
     fn drop(&mut self) {
-        self.advance();
-        self.advance();
-        self.collect();
+        // todo self.collect();
         for i in self.vec.as_slice() {
             if !i.is_null() {
                 unsafe { Box::from_raw(*i) };
