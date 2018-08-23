@@ -183,14 +183,14 @@ impl <T: std::clone::Clone> Descriptor<T> {
     }
 }
 
-pub struct Transaction<'a, P: 'a + std::clone::Clone> {
+pub struct Transaction<'a, 'b: 'a, P: 'a + 'b + std::clone::Clone> {
     vec: &'a AtomicPtrVec<P>,
     epoch: usize,
     descriptor: *mut Descriptor<P>,
-    collector: &'a Collector<'a, P>,
+    collector: &'a mut Collector<'b, P>,
 }
 
-impl <'a, P: std::clone::Clone> Transaction<'a, P> {
+impl <'a, 'b, P: std::clone::Clone> Transaction<'a, 'b, P> {
     pub fn apply(&mut self) -> bool {
         unsafe { (&mut *self.descriptor).apply(&self.vec) }
     }
@@ -304,7 +304,7 @@ impl <'a, P: std::clone::Clone> Transaction<'a, P> {
 
 }
 
-impl<'a, T: std::clone::Clone> Drop for Transaction<'a, T> {
+impl<'a, 'b, T: std::clone::Clone> Drop for Transaction<'a, 'b, T> {
     fn drop(&mut self) {
         unsafe {
             let d = &mut *self.descriptor;
@@ -315,7 +315,7 @@ impl<'a, T: std::clone::Clone> Drop for Transaction<'a, T> {
             if d.committed() {
                 for op in &d.operations {
                     if !op.old.is_null() && !Descriptor::is_tagged(op.old) {
-                        Box::from_raw(op.old);
+                        self.collector.collect_later(self.epoch, op.index, op.old);
                     }
                 }
             } else {
@@ -383,7 +383,7 @@ impl <P: std::clone::Clone> AtomicHeap<P> {
         let v = Vec::with_capacity(20);
         Collector {heap:self, delete: v}
     }
-    pub fn transaction<'a, 'b>(&'a self, collector: &'a mut Collector<'b, P>) -> Transaction<'a, P> {
+    pub fn transaction<'a, 'b>(&'a self, collector: &'a mut Collector<'b, P>) -> Transaction<'a, 'b, P> {
         let d = Box::new(Descriptor::new());
         Transaction {
             vec: &self.vec,
