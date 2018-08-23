@@ -196,7 +196,7 @@ impl <T: std::clone::Clone> Descriptor<T> {
     }
 }
 
-pub struct Ref<'a, T:'a> {
+pub struct Ref<'a, T:'a> { // make cow
     address: Address,
     ptr: *mut T,
     _marker: PhantomData<&'a T>,
@@ -388,7 +388,7 @@ enum SessionState {
 pub struct Session<'a, P: 'a + std::clone::Clone> {
     heap: &'a Heap<P>,
     collector: &'a Collector,
-    delete: Vec<Delete<P>>, 
+    delete: Option<Vec<Delete<P>>>, 
     state: SessionState,
     clear: bool,
 } 
@@ -399,14 +399,14 @@ impl <'a, P: std::clone::Clone> Session<'a, P> {
         Session {
             heap: heap, 
             collector: &heap.collector,
-            delete: v, 
+            delete: Some(v), 
             state: SessionState::Inactive, 
             clear: true,
         }
     }
     unsafe fn enter_critical(&mut self) {
+        self.collect();
         if self.state == SessionState::Inactive {
-            self.collect();
             self.state = self.collector.enter_session();
             self.clear = true;
         }
@@ -422,12 +422,13 @@ impl <'a, P: std::clone::Clone> Session<'a, P> {
 
     unsafe fn collect_later(&mut self, epoch: usize, address: Address, value: *mut P) {
         self.clear = false;
-        self.delete.push(Delete{epoch: epoch, address: address, value: value});
+        self.delete.as_mut().unwrap().push(Delete{epoch: epoch, address: address, value: value});
     }
 
     pub fn collect(&mut self) {
         self.heap.collect();
         let epoch = self.collector.current_epoch();
+        // peek at vec, clean any that are done
         // for x in delete, delete if epoch-2 ...
     }
     pub fn transaction<'b>(&'b mut self) -> Transaction<'b, 'a, P> {
@@ -438,19 +439,13 @@ impl <'a, P: std::clone::Clone> Session<'a, P> {
 
 impl<'a, T: std::clone::Clone> Drop for Session<'a, T> {
     fn drop(&mut self) {
-        let epoch = self.collector.current_epoch();
-        for d in self.delete.drain(0..) {
-            if d.epoch+2 <= epoch {
-                self.heap.collect_later(d.epoch, d.address, d.value);
-            } else {
-                unsafe { Box::from_raw(d.value); }
-            }
-        }
         unsafe {
             if self.state != SessionState::Inactive {
                 self.collector.exit_session(&self.state);
             }
         }
+        self.collect();
+        self.heap.collect_later(&mut self.delete.take().unwrap());
     }
 }
 
@@ -463,8 +458,13 @@ impl Collector {
     fn current_epoch(&self) -> usize {
         self.epoch.load(Ordering::SeqCst)
     }
+
+    fn advance(&self) -> usize {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
     unsafe fn enter_session(&self) -> SessionState {
-        // incr active
+        // incr active and advance
         return SessionState::Active
     }
 
@@ -473,15 +473,18 @@ impl Collector {
         match state {
             SessionState::Inactive => panic!{"sync!"},
             SessionState::Active => {
-                // incr quiet
+                // incr quiet or advance
                 
             },
             SessionState::Quiet(e) => {
                 if *e != epoch {
-                  //  incr quiet
+                  //  incr quiet or advance
+                } else {
+                    // advance
                 }
             }
         };
+        let epoch = self.current_epoch();
         SessionState::Quiet(epoch)
     }
 
@@ -507,15 +510,18 @@ impl Collector {
 pub struct Heap<P: std::clone::Clone> {
     vec: AtomicPtrVec<P>,
     collector: Collector,
+    delete: Mutex<Vec<Delete<P>>>, // Make atomic
 }
 
 impl <P: std::clone::Clone> Heap<P> {
     pub fn new(capacity: usize) -> Heap<P> {
         let t = AtomicPtrVec::new(capacity);
         let e = AtomicUsize::new(0);
+        let d = Vec::with_capacity(100);
         Heap {
             vec: t,
             collector: Collector { epoch:e, },
+            delete: Mutex::new(d)
         }
     }
 
@@ -527,11 +533,13 @@ impl <P: std::clone::Clone> Heap<P> {
         self.collector.current_epoch()
     }
 
-    fn collect_later(&self, epoch: usize, address: Address, value: *mut P) {
-        // todo
+    fn collect_later(&self, delete: &mut Vec<Delete<P>>) {
+        let mut v = self.delete.lock().unwrap();
+        v.append(delete);
     }
 
     pub fn collect(&self) {
+        let epoch = self.collector.advance();
         // check for free list
     }
 
@@ -625,6 +633,11 @@ mod tests {
             let mut txn = s.transaction();
             let o = txn.read(addr);
             print!("read: {}\n", o);
+        }
+        {
+            let mut txn = s.transaction();
+            txn.delete(addr);
+            txn.apply();
         }
     }
 }
