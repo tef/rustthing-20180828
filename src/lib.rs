@@ -12,12 +12,17 @@ use std::clone::Clone;
 use std::slice;
 
 
-// todo: make Descriptor use atomic state
-//       conflicted state
-//       Descriptor::race()
-//       session free list
-//       heap free list
-//       epoch advancement
+// todo
+//      epoch/quiecent collector
+//      refcount of active/quiet sessions + increment epoch when matching
+//      heap has global free list
+//
+//      descriptor uses atomicusize for state
+//      add conflicted state, auto cancels, maybe Result<>/bool?
+//      Descriptor::race()
+//
+//      insert uses free list of deleted entries
+//      one in session, one in heap
 
 type Address = usize;
 
@@ -81,7 +86,6 @@ impl <T> AtomicPtrVec<T> {
             }
         }
     }
-    // XXX as_mut_slice() instead
     pub fn as_slice(&mut self) -> &[*mut T] {
         unsafe { 
             let s = slice::from_raw_parts(self.ptr, self.len.load(Ordering::SeqCst));
@@ -188,7 +192,6 @@ impl <T: std::clone::Clone> Descriptor<T> {
 
 pub struct Transaction<'a, 'b: 'a, P: 'a + 'b + std::clone::Clone> {
     vec: &'a AtomicPtrVec<P>,
-    epoch: usize,
     descriptor: *mut Descriptor<P>,
     session: &'a mut Session<'b, P>,
 }
@@ -318,7 +321,7 @@ impl<'a, 'b, T: std::clone::Clone> Drop for Transaction<'a, 'b, T> {
             if d.committed() {
                 for op in &d.operations {
                     if !op.old.is_null() && !Descriptor::is_tagged(op.old) {
-                        self.session.collect_later(self.epoch, op.index, op.old);
+                        self.session.collect_later(op.index, op.old);
                     }
                 }
             } else {
@@ -329,6 +332,7 @@ impl<'a, 'b, T: std::clone::Clone> Drop for Transaction<'a, 'b, T> {
                 }
 
             }
+            self.session.exit_critical();
         }
     }
 }
@@ -340,66 +344,115 @@ struct Delete<P> {
 }
 
 pub struct Session<'a, P: 'a + std::clone::Clone> {
-    heap: &'a AtomicHeap<P>,
-    delete: Vec<Delete<P>>, // ArcMutex
-    // read_set
+    heap: &'a Heap<P>,
+    delete: Vec<Delete<P>>, 
+    active: bool,
 } 
 
 impl <'a, P: std::clone::Clone> Session<'a, P> {
-    fn collect_later(&mut self, epoch: usize, address: Address, value: *mut P) {
+    unsafe fn enter_critical(&mut self) {
+        if !self.active {
+            self.heap.enter_session();
+            self.active = true;
+        }
+    }
+    unsafe fn exit_critical(&mut self) {
+        // if epoch has advanced!
+        self.heap.clear_session(); 
+    }
+
+    unsafe fn collect_later(&mut self, address: Address, value: *mut P) {
+        let epoch = self.heap.epoch();
         self.delete.push(Delete{epoch: epoch, address: address, value: value});
     }
     pub fn collect(&mut self) {
-        // read current epoch, scan list, prune
+        // for x in delete, delete if epoch-2 ...
+        for d in self.delete.drain(0..) {
+            self.heap.collect_later(d.epoch, d.address, d.value);
+        }
     }
     pub fn transaction<'b>(&'b mut self) -> Transaction<'b, 'a, P> {
-        let d = Box::new(Descriptor::new());
-        Transaction {
-            vec: &self.heap.vec,
-            epoch: self.heap.current_epoch(),
-            descriptor: Box::into_raw(d),
-            session: self,
-        } 
+        self.heap.transaction(self)
     }
 
 }
 
 impl<'a, T: std::clone::Clone> Drop for Session<'a, T> {
     fn drop(&mut self) {
-        // spin and collect ?
-        // push onto heap's shared list
-        ;
+        for d in self.delete.drain(0..) {
+            self.heap.collect_later(d.epoch, d.address, d.value);
+        }
+        unsafe {
+            self.heap.clear_session();
+            self.heap.exit_session();
+        }
     }
 }
 
-pub struct AtomicHeap<P: std::clone::Clone> {
-    vec: AtomicPtrVec<P>,
-    epoch: AtomicUsize,
+struct Barrier {
+    epoch: AtomicUsize
+}
+impl Barrier {
+    fn current_epoch(&self) -> usize {
+        self.epoch.load(Ordering::SeqCst)
+    }
 }
 
-impl <P: std::clone::Clone> AtomicHeap<P> {
-    pub fn new(capacity: usize) -> AtomicHeap<P> {
+pub struct Heap<P: std::clone::Clone> {
+    vec: AtomicPtrVec<P>,
+    barrier: Barrier,
+}
+
+impl <P: std::clone::Clone> Heap<P> {
+    pub fn new(capacity: usize) -> Heap<P> {
         let t = AtomicPtrVec::new(capacity);
         let e = AtomicUsize::new(0);
-        AtomicHeap {
+        Heap {
             vec: t,
-            epoch: e,
+            barrier: Barrier { epoch:e, },
         }
     }
 
-    fn current_epoch(&self) -> usize {
-        self.epoch.load(Ordering::SeqCst)
+    unsafe fn enter_session(&self) {
+        // incr active
+    }
+
+    unsafe fn clear_session(&self) {
+        // incr quiet
+    }
+
+    unsafe fn exit_session(&self) {
+        // decr active
+    }
+
+    fn epoch(&self) -> usize {
+        self.barrier.current_epoch()
+    }
+
+    fn advance(&self) -> usize {
+        // check active == quiet and epoch +=1
+        self.epoch()
+    }
+
+    fn collect_later(&self, epoch: usize, address: Address, value: *mut P) {
+        // todo
+    }
+
+    pub fn collect(&self) {
+        self.advance();
+        // check for free list
     }
 
     pub fn session<'a>(&'a self) -> Session<'a, P> {
         let v = Vec::with_capacity(20);
-        Session {heap:self, delete: v}
+        Session {heap:self, delete: v, active: false}
     }
     pub fn transaction<'a, 'b>(&'a self, session: &'a mut Session<'b, P>) -> Transaction<'a, 'b, P> {
+        self.collect();
         let d = Box::new(Descriptor::new());
+        unsafe {session.enter_critical()};
         Transaction {
             vec: &self.vec,
-            epoch: self.current_epoch(),
             descriptor: Box::into_raw(d),
             session: session,
         } 
@@ -407,7 +460,7 @@ impl <P: std::clone::Clone> AtomicHeap<P> {
 
 }
 
-impl<T: std::clone::Clone> Drop for AtomicHeap<T> {
+impl<T: std::clone::Clone> Drop for Heap<T> {
     fn drop(&mut self) {
         for i in self.vec.as_slice() {
             if !i.is_null() {
@@ -438,14 +491,14 @@ impl <'a, T: fmt::Display> fmt::Display for Ref<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use AtomicHeap;
+    use Heap;
     use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::mem;
     use std::ptr;
     #[test]
     fn it_works() {
-        let h = Arc::new(AtomicHeap::new(1024));
+        let h = Arc::new(Heap::new(1024));
         let mut s = h.session();
         let mut addr = 0;
         {
@@ -465,6 +518,19 @@ mod tests {
             o.push_str(" mutated");
             txn.update(addr, old, o);
             txn.apply();
+        }
+        {
+            let mut txn = s.transaction();
+            let o = txn.read(addr).unwrap();
+            print!("read: {}\n", o);
+        }
+        {
+            let mut txn = s.transaction();
+            let old = txn.read(addr).unwrap();
+            let mut o = Box::new(old.clone());
+            o.push_str(" cancelled");
+            txn.update(addr, old, o);
+            txn.cancel();
         }
         {
             let mut txn = s.transaction();
