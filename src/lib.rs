@@ -13,22 +13,25 @@ use std::slice;
 
 
 // todo
-//      collector has 
-//      refcount of active/quiet sessions + increment epoch when matching
-//
-//      descriptor uses atomicusize for state
-//      add conflicted state, auto cancels, maybe Result<>/bool?
-//      Descriptor::race()
-//
-//      global free list is atomicdeque 
-//          with push/pop left      
+//      freeing in session when behind epoch
+//      freeing in heap when behind epoch
+//      session, heap have lists of empty addresses
 //      insert uses list of empty addresses
-//            one in session, one in heap
+//      
+//      using an atomicusize for descriptor state
+//      checking for success on commit
+//      checking for races on commit
+//      racing to commit in Descriptor::race()
+//      add conflicted state, auto cancels, maybe Result<>/bool?
+//      
+//      collector has atomic epoch, active count, quiet count
+//      collector does atomic inc/decr, and advancing epoch
 //
-//      inline
-//      tests
+//      global free list is atomicdeque with push/pop left      
 //
-//      trie?
+//      inline/annotations, tests, docs
+//
+//      then, trie?
 
 type Address = usize;
 
@@ -107,12 +110,12 @@ struct CAS<T> {index: usize, old: *mut T, new: *mut T}
 #[derive(PartialEq, Copy, Clone)]
 enum State { Reading = 0, Writing = 1 , Committing = 2, Committed = 3 , Cancelled = -1 }
 
-struct Descriptor<T: std::clone::Clone> {
+struct Descriptor<T> {
     state: State, // XXX Make Atomic
     operations: Vec<CAS<T>>,
 }
 
-impl <T: std::clone::Clone> Descriptor<T> {
+impl <T> Descriptor<T> {
     fn new() -> Descriptor<T> {
         let mut vec = Vec::with_capacity(8);
         Descriptor {
@@ -204,6 +207,14 @@ pub struct Ref<'a, T:'a> { // make cow
     _marker: PhantomData<&'a T>,
 }
 
+impl <'a, T: std::clone::Clone> Ref<'a, T> {
+    pub fn copy(&self) -> Box<T> {
+        unsafe {
+            Box::new((&*self.ptr).clone())
+        }
+    }
+}
+
 impl <'a, T> Deref for Ref<'a, T> {
     type Target = T;
     fn deref(&self) -> &T { unsafe { &*self.ptr} }
@@ -218,14 +229,14 @@ impl <'a, T: fmt::Display> fmt::Display for Ref<'a, T> {
     }
 }
 
-pub struct Transaction<'a, 'b: 'a, P: 'a + 'b + std::clone::Clone> {
+pub struct Transaction<'a, 'b: 'a, P: 'a + 'b>  {
     vec: &'a AtomicPtrVec<P>,
-    collector: &'a Collector,
+    collector: &'a Collector<P>,
     session: &'a mut Session<'b, P>,
     descriptor: *mut Descriptor<P>,
 }
 
-impl <'a, 'b, P: std::clone::Clone> Transaction<'a, 'b, P> {
+impl <'a, 'b, P> Transaction<'a, 'b, P> {
     fn new(heap: &'a Heap<P>, session: &'a mut Session<'b, P>) -> Transaction<'a, 'b, P> {
         let d = Box::new(Descriptor::new());
         unsafe {session.enter_critical()};
@@ -260,9 +271,13 @@ impl <'a, 'b, P: std::clone::Clone> Transaction<'a, 'b, P> {
         ptr
     }
           
-    pub fn read(&mut self, address:Address) -> Ref<'a, P> {
+    pub fn read(&mut self, address:Address) -> Option<Ref<'a, P>> {
         let ptr = self.load(address);
-        Ref{ address: address, ptr: ptr, _marker: PhantomData } 
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Ref{ address: address, ptr: ptr, _marker: PhantomData })
+        }
     }
 
     pub fn update(&mut self, old: Ref<'a, P>, new: Box<P>) {
@@ -322,31 +337,9 @@ impl <'a, 'b, P: std::clone::Clone> Transaction<'a, 'b, P> {
         }
     }
 
-
-    pub fn upsert<U: Fn(&mut P)>(&mut self, address: Address, value: Box<P>, on_conflict: U) {
-        let old = self.load(address);
-        if old.is_null() {
-            let ptr = Box::into_raw(value);
-            unsafe {
-                let d = &mut *self.descriptor;
-                d.add(address, ptr::null_mut(), ptr);
-            }
-        } else if !Descriptor::is_tagged(old) { 
-            let mut b = unsafe { Box::new( (*old).clone() ) };
-            on_conflict(&mut b);
-            let ptr = Box::into_raw(b);
-            unsafe {
-                let d = &mut *self.descriptor;
-                d.add(address, old, ptr);
-            }
-        } else {
-            panic!("conflict");
-        }
-    }
-
 }
 
-impl<'a, 'b, T: std::clone::Clone> Drop for Transaction<'a, 'b, T> {
+impl<'a, 'b, T> Drop for Transaction<'a, 'b, T> {
     fn drop(&mut self) {
         unsafe {
             let d = &mut *self.descriptor;
@@ -387,9 +380,9 @@ enum SessionState {
     Quiet(usize),
 }
 
-pub struct Session<'a, P: 'a + std::clone::Clone> {
+pub struct Session<'a, P: 'a> {
     heap: &'a Heap<P>,
-    collector: &'a Collector,
+    collector: &'a Collector<P>,
     delete: Option<Vec<Delete<P>>>, 
     state: SessionState,
     clear: bool,
@@ -401,7 +394,7 @@ enum SessionBehaviour {
     ClearOnExit, CloseOnExit, ClearOnExitCloseOnDelete
 }
 
-impl <'a, P: std::clone::Clone> Session<'a, P> {
+impl <'a, P> Session<'a, P> {
     fn new(heap: &'a Heap<P>, behaviour: SessionBehaviour) -> Session<'a, P> {
         let c: bool = match behaviour {
             SessionBehaviour::ClearOnExit => true,
@@ -447,7 +440,7 @@ impl <'a, P: std::clone::Clone> Session<'a, P> {
     }
 
     pub fn collect(&mut self) {
-        self.heap.collect();
+        self.collector.collect();
         let epoch = self.collector.current_epoch();
         // XXX
         // peek at vec, clean any that are done
@@ -459,7 +452,7 @@ impl <'a, P: std::clone::Clone> Session<'a, P> {
 
 }
 
-impl<'a, T: std::clone::Clone> Drop for Session<'a, T> {
+impl<'a, T> Drop for Session<'a, T> {
     fn drop(&mut self) {
         unsafe {
             if self.state != SessionState::Inactive {
@@ -467,22 +460,34 @@ impl<'a, T: std::clone::Clone> Drop for Session<'a, T> {
             }
         }
         self.collect();
-        self.heap.collect_later(&mut self.delete.take().unwrap());
+        self.collector.collect_later(&mut self.delete.take().unwrap());
     }
 }
 
 
-struct Collector {
-    epoch: AtomicUsize
+struct Collector<P> {
+    epoch: AtomicUsize,
+    delete: Mutex<Vec<Delete<P>>>, // Make atomic
 }
 
-impl Collector {
+impl<P> Collector<P> {
     fn current_epoch(&self) -> usize {
         self.epoch.load(Ordering::SeqCst)
     }
 
     fn advance(&self) -> usize {
         self.epoch.load(Ordering::SeqCst)
+    }
+
+    fn collect_later(&self, delete: &mut Vec<Delete<P>>) {
+        let mut v = self.delete.lock().unwrap();
+        v.append(delete);
+    }
+
+    pub fn collect(&self) {
+        let epoch = self.advance();
+        // check for free list
+        // XXX
     }
 
     unsafe fn enter_session(&self) -> SessionState {
@@ -529,46 +534,32 @@ impl Collector {
 }
 
 
-pub struct Heap<P: std::clone::Clone> {
+pub struct Heap<P> {
     vec: AtomicPtrVec<P>,
-    collector: Collector,
-    delete: Mutex<Vec<Delete<P>>>, // Make atomic
+    collector: Collector<P>,
 }
 
-impl <P: std::clone::Clone> Heap<P> {
+impl <P> Heap<P> {
     pub fn new(capacity: usize) -> Heap<P> {
         let t = AtomicPtrVec::new(capacity);
         let e = AtomicUsize::new(0);
         let d = Vec::with_capacity(100);
         Heap {
             vec: t,
-            collector: Collector { epoch:e, },
-            delete: Mutex::new(d)
+            collector: Collector { epoch:e, delete: Mutex::new(d) },
         }
     }
 
     pub fn session<'a>(&'a self) -> Session<'a, P> {
-        Session::new(self, SessionBehaviour::ClearOnExit)
+        Session::new(self, SessionBehaviour::ClearOnExitCloseOnDelete)
     }
 
     fn epoch(&self) -> usize {
         self.collector.current_epoch()
     }
-
-    fn collect_later(&self, delete: &mut Vec<Delete<P>>) {
-        let mut v = self.delete.lock().unwrap();
-        v.append(delete);
-    }
-
-    pub fn collect(&self) {
-        let epoch = self.collector.advance();
-        // check for free list
-        // XXX
-    }
-
 }
 
-impl<T: std::clone::Clone> Drop for Heap<T> {
+impl<T> Drop for Heap<T> {
     fn drop(&mut self) {
         // todo self.collect();
         for i in self.vec.as_slice() {
@@ -641,20 +632,20 @@ mod tests {
         }
         {
             let mut txn = s.transaction();
-            let o = txn.read(addr);
+            let o = txn.read(addr).unwrap();
             print!("read: {}\n", o);
         }
         {
             let mut txn = s.transaction();
-            let old = txn.read(addr);
-            let mut new = Box::new(old.clone());
+            let old = txn.read(addr).unwrap();
+            let mut new = old.copy();
             new.push_str(" mutated");
             txn.update(old, new);
             txn.apply();
         }
         {
             let mut txn = s.transaction();
-            let o = txn.read(addr);
+            let o = txn.read(addr).unwrap();
             print!("read: {}\n", o);
         }
         {
