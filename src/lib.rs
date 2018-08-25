@@ -410,7 +410,7 @@ enum SessionState {
 pub struct Session<'a, P: 'a> {
     heap: &'a Heap<P>,
     collector: &'a Collector<P>,
-    delete: Option<Vec<Delete<P>>>, 
+    delete: Vec<Delete<P>>, 
     state: SessionState,
     clear: bool,
     behaviour: SessionBehaviour,
@@ -432,7 +432,7 @@ impl <'a, P> Session<'a, P> {
         Session {
             heap: heap, 
             collector: &heap.collector,
-            delete: Some(v), 
+            delete: v, 
             state: SessionState::Inactive, 
             clear: c,
             behaviour: behaviour,
@@ -468,15 +468,22 @@ impl <'a, P> Session<'a, P> {
         if self.behaviour == SessionBehaviour::ClearOnExitCloseOnDelete {
             self.clear = false;
         }
-        self.delete.as_mut().unwrap().push(Delete{epoch: epoch, address: address, value: value});
+        self.delete.push(Delete{epoch: epoch, address: address, value: value});
     }
 
     pub fn collect(&mut self) {
-        self.collector.collect();
         let epoch = self.collector.current_epoch();
-        // XXX
-        // peek at vec, clean any that are done
-        // for x in delete, delete if epoch-2 ...
+        let mut i = 0;
+        let l = self.delete.len();
+        while i < l {
+            let e = self.delete.get(i).unwrap().epoch;
+            if e+2 <= epoch {
+                self.delete.remove(i);
+            } else {
+                break;
+            }
+            i+=1;
+        }
     }
 }
 
@@ -488,7 +495,7 @@ impl<'a, T> Drop for Session<'a, T> {
             }
         }
         self.collect();
-        self.collector.collect_later(&mut self.delete.take().unwrap());
+        self.collector.collect_later(&mut self.delete);
     }
 }
 
@@ -576,6 +583,7 @@ impl <P> Heap<P> {
     }
 
     pub fn session<'a>(&'a self) -> Session<'a, P> {
+        self.collector.collect();
         Session::new(self, SessionBehaviour::ClearOnExitCloseOnDelete)
     }
 
