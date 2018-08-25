@@ -2,7 +2,7 @@
 
 use std::borrow::Borrow;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, AtomicIsize, Ordering};
 use std::ptr;
 use std::mem;
 use std::ops::Deref;
@@ -13,22 +13,20 @@ use std::slice;
 
 
 // todo
-//      freeing in session when behind epoch
-//      freeing in heap when behind epoch
-//      session, heap have lists of empty addresses
-//      insert uses list of empty addresses
-//      
 //      using an atomicusize for descriptor state
-//      checking for success on commit
-//      checking for races on commit
-//      racing to commit in Descriptor::race()
+//      on read, racing to commit in Descriptor::race()
+//      
 //      add conflicted state, auto cancels, maybe Result<>/bool?
 //      
 //      collector has atomic epoch, active count, quiet count
 //      collector does atomic inc/decr, and advancing epoch
 //
-//      global free list is atomicdeque with push/pop left      
+//      remove locks from heap, session delete
+//      list is atomicdeque with push/pop left      
 //
+//      session, heap have lists of empty addresses
+//      insert uses list of empty addresses
+//      
 //      inline/annotations, tests, docs
 //
 //      then, trie?
@@ -53,6 +51,7 @@ impl <T> AtomicPtrVec<T> {
         mem::forget(v);
         a
     }
+
     pub fn append(&self, value: *mut T) -> Result<usize, ()> {
         let index = self.len.fetch_add(1, Ordering::SeqCst);
         if index >= self.cap {
@@ -108,10 +107,10 @@ impl <T> AtomicPtrVec<T> {
 struct CAS<T> {index: usize, old: *mut T, new: *mut T}
 
 #[derive(PartialEq, Copy, Clone)]
-enum State { Reading = 0, Writing = 1 , Committing = 2, Committed = 3 , Cancelled = -1, Conflicted = -2 }
+enum State { Reading = 0, Writing = 1 , Preparing =2, Committing = 3, Committed = 4 , Cancelled = -1, Conflicted = -2 }
 
 struct Descriptor<T> {
-    state: State, // XXX Make Atomic
+    _state: AtomicIsize,
     operations: Vec<CAS<T>>,
 }
 
@@ -119,14 +118,30 @@ impl <T> Descriptor<T> {
     fn new() -> Descriptor<T> {
         let mut vec = Vec::with_capacity(8);
         Descriptor {
-            state: State::Reading,
+            _state: AtomicIsize::new(State::Reading as isize),
             operations: vec,
         }
     }
+    fn state(&self) -> State {
+        let i = self._state.load(Ordering::Relaxed);
+        match i {
+            0 => State::Reading,
+            1 => State::Writing,
+            2 => State::Preparing,
+            3 => State::Committing,
+            4 => State::Committed,
+            -1 => State::Cancelled,
+            -2 => State::Conflicted,
+            _ => panic!("state"),
+        }
+    }
+    fn set_state(&self, state: State, ordering: Ordering) {
+        self._state.store(state as isize, ordering);
+    }
     fn add(&mut self, index: usize, old: *mut T, new: *mut T) {
-        if self.state == State::Reading {
-            self.state = State::Writing;
-        } else if self.state != State::Writing {
+        if self.state() == State::Reading {
+            self.set_state(State::Writing, Ordering::Relaxed);
+        } else if self.state() != State::Writing {
             panic!("welp");
         }
         self.operations.push( 
@@ -135,13 +150,15 @@ impl <T> Descriptor<T> {
     }
 
     fn complete(&self) -> bool {
-        self.state == State::Reading ||
-        self.state == State::Cancelled ||
-        self.state == State::Committed
+        let state = self.state();
+        state == State::Reading ||
+        state == State::Committed ||
+        state == State::Cancelled ||
+        state == State::Conflicted
     }
 
     fn committed(&self) -> bool {
-        self.state == State::Committed
+        self.state() == State::Committed
     }
 
     fn tagged_ptr(&self) -> *mut T {
@@ -152,15 +169,14 @@ impl <T> Descriptor<T> {
     }
 
     fn apply(&mut self, vec: &AtomicPtrVec<T>) -> bool {
-        if self.state == State::Committing || self.state == State::Cancelled {
-            panic!("welp");
-        }
-        if self.state == State::Reading {
-            self.state = State::Committed;
-        } else if self.state == State::Writing {
-            let mut cancelled = false;
+        let state = self.state();
+        if state == State::Reading {
+            self.set_state(State::Committed, Ordering::Relaxed);
+            true
+        } else if state == State::Writing {
+            let mut conflict = false;
             let mut changed = 0;
-            self.state = State::Committing; // XXX
+            self.set_state(State::Preparing, Ordering::SeqCst);
             let fake = self.tagged_ptr();
             // swap in descriptor, inserts already placed
             for x in &self.operations {
@@ -169,14 +185,15 @@ impl <T> Descriptor<T> {
                     if result.is_ok() {
                         changed +=1;
                     } else {
-                        cancelled = true;
+                        conflict = true;
                         break;
                     }
                 } else { 
                     changed += 1;
                 }
             }
-            if cancelled {
+            if conflict {
+                self.set_state(State::Conflicted, Ordering::SeqCst);
                 while changed > 0 {
                     changed -=1;
                     let x = self.operations.get(changed).unwrap();
@@ -188,24 +205,28 @@ impl <T> Descriptor<T> {
                         if result.is_err() { panic!("sync") }
                     }
                 }
-                self.state = State::Conflicted;
+                false
             } else {
+                self.set_state(State::Committing, Ordering::SeqCst);
                 for x in &self.operations {
                     let result = vec.compare_and_swap(x.index, fake, x.new);
                     if result.is_err() { panic!("sync") }
                 }
-                self.state = State::Committed;
+                self.set_state(State::Committed, Ordering::SeqCst);
+                true
             }
+        } else if state == State::Committed {
+            true
+        } else if state == State::Cancelled || state == State::Conflicted {
+            false
+        } else {
+            panic!("bad state");
         }
-
-        self.state == State::Committed
     }
 
     fn cancel(&mut self, vec: &AtomicPtrVec<T>) {
-        if self.state == State::Committing || self.state == State::Cancelled {
-            panic!("welp");
-        }
-        if self.state == State::Writing {
+        let state = self.state();
+        if state == State::Writing {
             let fake = self.tagged_ptr();
             for x in &self.operations {
                 if x.old == fake {
@@ -213,8 +234,8 @@ impl <T> Descriptor<T> {
                     // check for success, or race
                 }
             }
+            self.set_state(State::Cancelled, Ordering::SeqCst);
         }
-        self.state = State::Cancelled;
     }
 
     fn is_tagged(ptr: *mut T) -> bool {
@@ -513,8 +534,18 @@ impl<P> Collector<P> {
 
     pub fn collect(&self) {
         let epoch = self.current_epoch();
-        // check for free list
-        // XXX
+        let mut i = 0;
+        let mut v = self.delete.lock().unwrap();
+        let l = v.len();
+        while i < l {
+            let e = v.get(i).unwrap().epoch;
+            if e+2 <= epoch {
+                v.remove(i);
+            } else {
+                break;
+            }
+            i+=1;
+        }
     }
 
     fn current_epoch(&self) -> usize {
