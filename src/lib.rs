@@ -108,7 +108,7 @@ impl <T> AtomicPtrVec<T> {
 struct CAS<T> {index: usize, old: *mut T, new: *mut T}
 
 #[derive(PartialEq, Copy, Clone)]
-enum State { Reading = 0, Writing = 1 , Committing = 2, Committed = 3 , Cancelled = -1 }
+enum State { Reading = 0, Writing = 1 , Committing = 2, Committed = 3 , Cancelled = -1, Conflicted = -2 }
 
 struct Descriptor<T> {
     state: State, // XXX Make Atomic
@@ -155,22 +155,49 @@ impl <T> Descriptor<T> {
         if self.state == State::Committing || self.state == State::Cancelled {
             panic!("welp");
         }
-        if self.state == State::Writing {
+        if self.state == State::Reading {
+            self.state = State::Committed;
+        } else if self.state == State::Writing {
+            let mut cancelled = false;
+            let mut changed = 0;
+            self.state = State::Committing; // XXX
             let fake = self.tagged_ptr();
+            // swap in descriptor, inserts already placed
             for x in &self.operations {
                 if x.old != fake {
-                    print!("new\n");
-                    let result = vec.compare_and_swap(x.index, x.old, x.new);
-                    // XXX check for success, or race
+                    let result = vec.compare_and_swap(x.index, x.old, fake);
+                    if result.is_ok() {
+                        changed +=1;
+                    } else {
+                        cancelled = true;
+                        break;
+                    }
+                } else { 
+                    changed += 1;
                 }
             }
-            for x in &self.operations {
-                print!("replace\n");
-                let result = vec.compare_and_swap(x.index, x.old, x.new);
-                // XXX check for success, or race
+            if cancelled {
+                while changed > 0 {
+                    changed -=1;
+                    let x = self.operations.get(changed).unwrap();
+                    if x.old != fake {
+                        let result = vec.compare_and_swap(x.index, fake, x.old);
+                        if result.is_err() { panic!("sync") }
+                    } else {
+                        let result = vec.compare_and_swap(x.index, fake, ptr::null_mut());
+                        if result.is_err() { panic!("sync") }
+                    }
+                }
+                self.state = State::Conflicted;
+            } else {
+                for x in &self.operations {
+                    let result = vec.compare_and_swap(x.index, fake, x.new);
+                    if result.is_err() { panic!("sync") }
+                }
+                self.state = State::Committed;
             }
-            self.state = State::Committed;
         }
+
         self.state == State::Committed
     }
 
