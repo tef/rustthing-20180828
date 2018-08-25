@@ -15,9 +15,6 @@ use std::slice;
 // todo
 //      on read, racing to commit in Descriptor::race()
 //      
-//      collector has atomic epoch, active count, quiet count
-//      collector does atomic inc/decr, and advancing epoch
-//
 //      remove locks from heap, session delete
 //      list is atomicdeque with push/pop left      
 //
@@ -242,7 +239,7 @@ impl <T> Descriptor<T> {
     unsafe fn race(me: *mut Descriptor<T>, other: *mut T) {
         let ptr: usize = mem::transmute(other);
         let ptr: *mut Descriptor<T> = mem::transmute(ptr & (!1 as usize));
-        panic!("no race");
+        // panic!("no race");
     }
 }
 
@@ -492,15 +489,13 @@ impl <'a, P> Session<'a, P> {
     pub fn collect(&mut self) {
         let epoch = self.collector.epoch();
         let mut i = 0;
-        let l = self.delete.len();
-        while i < l {
+        while i < self.delete.len() {
             let e = self.delete.get(i).unwrap().epoch;
             if e+2 <= epoch {
                 self.delete.remove(i);
             } else {
                 break;
             }
-            i+=1;
         }
     }
 }
@@ -533,15 +528,13 @@ impl<P> Collector<P> {
         let epoch = self.epoch();
         let mut i = 0;
         let mut v = self.delete.lock().unwrap();
-        let l = v.len();
-        while i < l {
+        while i < v.len() {
             let e = v.get(i).unwrap().epoch;
             if e+2 <= epoch {
                 v.remove(i);
             } else {
                 break;
             }
-            i+=1;
         }
     }
 
@@ -692,6 +685,8 @@ impl <P> Heap<P> {
     }
 
 }
+unsafe impl <T> Send for Heap<T> {}
+unsafe impl <T> Sync for Heap<T> {}
 
 impl<T> Drop for Heap<T> {
     fn drop(&mut self) {
@@ -710,6 +705,7 @@ mod tests {
     use std::sync::Arc;
     use std::mem;
     use std::ptr;
+    use std::thread;
     #[test]
     fn it_works() {
         let h = Arc::new(Heap::new(1024));
@@ -755,6 +751,46 @@ mod tests {
         }
         s.collect();
     }
+    #[test]
+    fn threadtest() {
+        let h = Arc::new(Heap::<usize>::new(1024));
+        let nitems = 100;
+        let nthreads = 100;
+        { 
+            let mut s = h.session();
+            let mut t = s.transaction();
+            for i in 0..nitems {
+                t.insert(Box::new(0));
+            };
+            t.apply();
+        }
+        let mut threads = vec![];
+        for i in 0..nthreads {
+            let bh = h.clone();
+            let t = thread::spawn(move || {
+                let mut s = bh.session();
+                for i in 0..nitems { loop {
+                    let mut t = s.transaction();
+                    let n = t.borrow(i).unwrap();
+                    t.compare_and_swap(i, n, Box::new(n+1));
+                    if t.apply() { break }
+                } }
+            });
+            threads.push(t);
+        };
+        for t in threads {
+            let _ = t.join();
+        };
+        { 
+            let mut s = h.session();
+            let mut t = s.transaction();
+            for i in 0..nitems {
+                let v = t.borrow(i).unwrap();
+                assert!(*v == nthreads);
+            };
+        }
+    }
+
     #[test]
     fn test2() {
         let h = Arc::new(Heap::new(1024));
