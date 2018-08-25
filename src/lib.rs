@@ -13,10 +13,7 @@ use std::slice;
 
 
 // todo
-//      using an atomicusize for descriptor state
 //      on read, racing to commit in Descriptor::race()
-//      
-//      add conflicted state, auto cancels, maybe Result<>/bool?
 //      
 //      collector has atomic epoch, active count, quiet count
 //      collector does atomic inc/decr, and advancing epoch
@@ -396,7 +393,7 @@ impl<'a, 'b, T> Drop for Transaction<'a, 'b, T> {
             }
             let mut d = Box::from_raw(self.descriptor);
             if d.committed() {
-                let epoch = self.collector.current_epoch();
+                let epoch = self.collector.epoch();
                 for op in &d.operations {
                     if !op.old.is_null() && !Descriptor::is_tagged(op.old) {
                         self.session.collect_later(epoch, op.index, op.old);
@@ -493,7 +490,7 @@ impl <'a, P> Session<'a, P> {
     }
 
     pub fn collect(&mut self) {
-        let epoch = self.collector.current_epoch();
+        let epoch = self.collector.epoch();
         let mut i = 0;
         let l = self.delete.len();
         while i < l {
@@ -522,7 +519,7 @@ impl<'a, T> Drop for Session<'a, T> {
 
 
 struct Collector<P> {
-    epoch: AtomicUsize,
+    state: AtomicUsize,
     delete: Mutex<Vec<Delete<P>>>, // Make atomic
 }
 
@@ -533,7 +530,7 @@ impl<P> Collector<P> {
     }
 
     pub fn collect(&self) {
-        let epoch = self.current_epoch();
+        let epoch = self.epoch();
         let mut i = 0;
         let mut v = self.delete.lock().unwrap();
         let l = v.len();
@@ -548,20 +545,80 @@ impl<P> Collector<P> {
         }
     }
 
-    fn current_epoch(&self) -> usize {
-        self.epoch.load(Ordering::SeqCst)
+    fn epoch(&self) -> usize {
+        self.state.load(Ordering::SeqCst) & 0xFFFF
     }
 
     unsafe fn incr_active(&self) {
-
+        loop {
+            let state: usize  = self.state.load(Ordering::SeqCst); 
+            let epoch = state & 0x0000_0000_FFFF_FFFF;
+            let mut active = (state & 0x0000_FFFF_0000_0000) >> 32;
+            let quiet = (state & 0xFFFF_0000_0000_0000) >> 48;
+            active +=1;
+            let new = (quiet << 48) | (active << 32) | epoch;
+            let result = self.state.compare_and_swap(state, new, Ordering::SeqCst);
+            if result == state {
+                break
+            }
+        }
     }
 
-    unsafe fn set_quiet(&self, quiet_epoch: Option<usize>) -> usize {
-        self.current_epoch()
+    unsafe fn set_quiet(&self, quiet_epoch: Option<usize>) -> (bool, usize) {
+        let mut epoch = 0;
+        let mut new_epoch = false;
+        loop {
+            let state = self.state.load(Ordering::SeqCst); 
+            epoch = state & 0x0000_0000_FFFF_FFFF;
+            let active = (state & 0x0000_FFFF_0000_0000) >> 32;
+            let mut quiet = (state & 0xFFFF_0000_0000_0000) >> 48;
+            new_epoch = false;
+            if quiet_epoch.is_none() || quiet_epoch.unwrap() != epoch {
+                quiet +=1;
+                if quiet == active {
+                    quiet = 0;
+                    epoch +=1;
+                    new_epoch = true
+                }
+            } else {
+                break
+            }
+            let new = (quiet << 48) | (active << 32) | epoch;
+            let result = self.state.compare_and_swap(state, new, Ordering::SeqCst);
+            if result == state {
+                break
+            }
+        }
+        (new_epoch, epoch)
     }
 
-    unsafe fn decr_active(&self, quiet_epoch: Option<usize>) -> usize {
-        self.current_epoch()
+    unsafe fn decr_active(&self, quiet_epoch: Option<usize>) -> (bool, usize) {
+        let mut epoch = 0;
+        let mut new_epoch = false;
+        loop {
+            let state = self.state.load(Ordering::SeqCst);
+            epoch = state & 0x0000_0000_FFFF_FFFF;
+            let mut active = (state & 0x0000_FFFF_0000_0000) >> 32;
+            let mut quiet = (state & 0xFFFF_0000_0000_0000) >> 48;
+            new_epoch = false;
+            if quiet_epoch.is_some() && quiet_epoch.unwrap() == epoch {
+                active -=1;
+                quiet -=1;
+            } else {
+                active-=1;
+            }
+            if quiet == active {
+                quiet = 0;
+                epoch +=1;
+                new_epoch = true;
+            }
+            let new = (quiet << 48) | (active << 32) | epoch;
+            let result = self.state.compare_and_swap(state, new, Ordering::SeqCst);
+            if result == state {
+                break
+            }
+        }
+        (new_epoch, epoch)
     }
 
     unsafe fn enter_session(&self) -> SessionState {
@@ -570,13 +627,25 @@ impl<P> Collector<P> {
     }
 
     unsafe fn clear_session(&self, state: &SessionState) -> SessionState{
-        let mut epoch = self.current_epoch();
         match state {
             SessionState::Inactive => { panic!("sync!") },
-            SessionState::Active => { epoch = self.set_quiet(None); },
-            SessionState::Quiet(e) => { epoch = self.set_quiet(Some(*e)) },
-        };
-        SessionState::Quiet(epoch)
+            SessionState::Active => { 
+                let (new_epoch, epoch) = self.set_quiet(None);
+                if new_epoch {
+                    SessionState::Active
+                } else { 
+                    SessionState::Quiet(epoch)
+                }
+            },
+            SessionState::Quiet(e) => {
+                let (new_epoch, epoch) = self.set_quiet(Some(*e));
+                if new_epoch {
+                    SessionState::Active
+                } else { 
+                    SessionState::Quiet(epoch)
+                }
+            },
+        }
     }
 
     unsafe fn exit_session(&self, state: &SessionState) -> SessionState {
@@ -609,7 +678,7 @@ impl <P> Heap<P> {
         let d = Vec::with_capacity(100);
         Heap {
             vec: t,
-            collector: Collector { epoch:e, delete: Mutex::new(d) },
+            collector: Collector { state: e, delete: Mutex::new(d) },
         }
     }
 
@@ -644,6 +713,8 @@ mod tests {
     #[test]
     fn it_works() {
         let h = Arc::new(Heap::new(1024));
+        let mut s1 = h.session();
+        let mut txn1 = s1.transaction();
         let mut s = h.session();
         let mut addr = 0;
         {
@@ -654,7 +725,7 @@ mod tests {
         {
             let mut txn = s.transaction();
             let o = txn.borrow(addr).unwrap();
-            print!("read: {}\n", o);
+            assert!(o == "example");
         }
         {
             let mut txn = s.transaction();
@@ -667,7 +738,7 @@ mod tests {
         {
             let mut txn = s.transaction();
             let o = txn.borrow(addr).unwrap();
-            print!("read: {}\n", o);
+            assert!(o == "example mutated");
         }
         {
             let mut txn = s.transaction();
@@ -680,7 +751,7 @@ mod tests {
         {
             let mut txn = s.transaction();
             let o = txn.borrow(addr).unwrap();
-            print!("read: {}\n", o);
+            assert!(o == "example mutated");
         }
         s.collect();
     }
@@ -697,7 +768,6 @@ mod tests {
         {
             let mut txn = s.transaction();
             let o = txn.read(addr).unwrap();
-            print!("read: {}\n", o);
         }
         {
             let mut txn = s.transaction();
@@ -710,7 +780,6 @@ mod tests {
         {
             let mut txn = s.transaction();
             let o = txn.read(addr).unwrap();
-            print!("read: {}\n", o);
         }
         {
             let mut txn = s.transaction();
