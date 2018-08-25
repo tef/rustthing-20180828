@@ -239,7 +239,7 @@ pub struct Transaction<'a, 'b: 'a, P: 'a + 'b>  {
 impl <'a, 'b, P> Transaction<'a, 'b, P> {
     fn new(heap: &'a Heap<P>, session: &'a mut Session<'b, P>) -> Transaction<'a, 'b, P> {
         let d = Box::new(Descriptor::new());
-        unsafe {session.enter_critical()};
+        unsafe {session.start_transaction()};
         Transaction {
             vec: &heap.vec,
             collector: &heap.collector,
@@ -362,7 +362,7 @@ impl<'a, 'b, T> Drop for Transaction<'a, 'b, T> {
                 }
 
             }
-            self.session.exit_critical();
+            self.session.exit_transaction();
         }
     }
 }
@@ -411,7 +411,12 @@ impl <'a, P> Session<'a, P> {
             behaviour: behaviour,
         }
     }
-    unsafe fn enter_critical(&mut self) {
+
+    pub fn transaction<'b>(&'b mut self) -> Transaction<'b, 'a, P> {
+        Transaction::new(self.heap, self)
+    }
+
+    unsafe fn start_transaction(&mut self) {
         self.collect();
         let c: bool = match self.behaviour {
             SessionBehaviour::ClearOnExit => true,
@@ -423,7 +428,7 @@ impl <'a, P> Session<'a, P> {
             self.clear = c;
         }
     }
-    unsafe fn exit_critical(&mut self) {
+    unsafe fn exit_transaction(&mut self) {
         if self.clear {
             self.state = self.collector.clear_session(&self.state);
         } else {
@@ -446,10 +451,6 @@ impl <'a, P> Session<'a, P> {
         // peek at vec, clean any that are done
         // for x in delete, delete if epoch-2 ...
     }
-    pub fn transaction<'b>(&'b mut self) -> Transaction<'b, 'a, P> {
-        Transaction::new(self.heap, self)
-    }
-
 }
 
 impl<'a, T> Drop for Session<'a, T> {
@@ -471,68 +472,65 @@ struct Collector<P> {
 }
 
 impl<P> Collector<P> {
-    fn current_epoch(&self) -> usize {
-        self.epoch.load(Ordering::SeqCst)
-    }
-
-    fn advance(&self) -> usize {
-        self.epoch.load(Ordering::SeqCst)
-    }
-
     fn collect_later(&self, delete: &mut Vec<Delete<P>>) {
         let mut v = self.delete.lock().unwrap();
         v.append(delete);
     }
 
     pub fn collect(&self) {
-        let epoch = self.advance();
+        let epoch = self.current_epoch();
         // check for free list
         // XXX
     }
 
+    fn current_epoch(&self) -> usize {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    unsafe fn incr_active(&self) {
+
+    }
+
+    unsafe fn set_quiet(&self, quiet_epoch: Option<usize>) -> usize {
+        self.current_epoch()
+    }
+
+    unsafe fn decr_active(&self, quiet_epoch: Option<usize>) -> usize {
+        self.current_epoch()
+    }
+
     unsafe fn enter_session(&self) -> SessionState {
-        // incr active and advance
-        return SessionState::Active
+        self.incr_active();
+        SessionState::Active
     }
 
     unsafe fn clear_session(&self, state: &SessionState) -> SessionState{
-        let epoch = self.current_epoch();
+        let mut epoch = self.current_epoch();
         match state {
-            SessionState::Inactive => panic!{"sync!"},
-            SessionState::Active => {
-                // incr quiet or advance
-                
-            },
-            SessionState::Quiet(e) => {
-                if *e != epoch {
-                  //  incr quiet or advance
-                } else {
-                    // advance
-                }
-            }
+            SessionState::Inactive => { panic!("sync!") },
+            SessionState::Active => { epoch = self.set_quiet(None); },
+            SessionState::Quiet(e) => { epoch = self.set_quiet(Some(*e)) },
         };
-        let epoch = self.current_epoch();
         SessionState::Quiet(epoch)
     }
 
     unsafe fn exit_session(&self, state: &SessionState) -> SessionState {
         match state {
             SessionState::Inactive => {},
-            SessionState::Active => {
-                // decr active
-                
-            },
-            SessionState::Quiet(e) =>  {
-                //decr quiet 
-            }
+            SessionState::Active => { self.decr_active(None); },
+            SessionState::Quiet(e) =>  { self.decr_active(Some(*e)); },
         };
-        // decr active
         SessionState::Inactive
-        // check if currently active, etc
     }
 
 }
 
+impl<T> Drop for Collector<T> {
+    fn drop(&mut self) {
+        let mut v = self.delete.lock().unwrap();
+        v.clear();
+    }
+}
 
 pub struct Heap<P> {
     vec: AtomicPtrVec<P>,
@@ -554,14 +552,14 @@ impl <P> Heap<P> {
         Session::new(self, SessionBehaviour::ClearOnExitCloseOnDelete)
     }
 
-    fn epoch(&self) -> usize {
-        self.collector.current_epoch()
+    pub fn collect(&self) {
+        self.collector.collect()
     }
+
 }
 
 impl<T> Drop for Heap<T> {
     fn drop(&mut self) {
-        // todo self.collect();
         for i in self.vec.as_slice() {
             if !i.is_null() {
                 unsafe { Box::from_raw(*i) };
