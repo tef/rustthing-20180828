@@ -765,11 +765,12 @@ mod tests {
             t.apply();
         }
         let mut threads = vec![];
-        for i in 0..nthreads {
+        for t in 0..nthreads {
             let bh = h.clone();
             let t = thread::spawn(move || {
                 let mut s = bh.session();
                 for i in 0..nitems { loop {
+                    print!("thread: {}\n", t);
                     let mut t = s.transaction();
                     let n = t.borrow(i).unwrap();
                     t.compare_and_swap(i, n, Box::new(n+1));
