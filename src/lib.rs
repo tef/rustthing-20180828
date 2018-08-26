@@ -386,6 +386,15 @@ impl <'a, 'b, P> Transaction<'a, 'b, P> {
         unsafe {
             let d = &mut *self.descriptor;
             let fake = d.tagged_ptr();
+            let mut address;
+            while self.session.free_addr.len() > 0 {
+                address = self.session.free_addr.pop().unwrap();
+                let result = self.vec.compare_and_swap(address, ptr::null_mut(), fake);
+                if result.is_ok() {
+                    d.add(address, fake, ptr);
+                    return address;
+                }
+            }
             let addr = self.vec.append(fake).unwrap();
             d.add(addr, fake, ptr);
             addr
@@ -425,15 +434,24 @@ impl<'a, 'b, T> Drop for Transaction<'a, 'b, T> {
             if d.committed() {
                 let epoch = self.collector.epoch();
                 for op in &d.operations {
+                    if op.new.is_null() {
+                        self.session.free_address(op.index);
+                    }
                     if !op.old.is_null() && !Descriptor::is_tagged(op.old) {
                         let b = Box::from_raw(op.old);
-                        self.session.collect_later(epoch, op.index, b);
+                        self.session.collect_later(epoch, b);
                     }
                 }
             } else {
                 for op in &d.operations {
-                    if !op.new.is_null() && !Descriptor::is_tagged(op.new) {
+                    if Descriptor::is_tagged(op.new) {
+                        panic!("sync");
+                    }
+                    if !op.new.is_null() {
                         Box::from_raw(op.new);
+                    }
+                    if op.old.is_null() {
+                        self.session.free_address(op.index);
                     }
                 }
 
@@ -445,7 +463,6 @@ impl<'a, 'b, T> Drop for Transaction<'a, 'b, T> {
 
 struct Delete<P> {
     epoch: usize,
-    address: Address,
     value: Box<P>,
 }
 
@@ -519,12 +536,17 @@ impl <'a, P> Session<'a, P> {
         }
     }
 
+    #[inline] 
+    fn free_address(&mut self, address: Address) {
+        self.free_addr.push(address);
+    }
+
     #[inline]
-    unsafe fn collect_later(&mut self, epoch: usize, address: Address, value: Box<P>) {
+    fn collect_later(&mut self, epoch: usize, value: Box<P>) {
         if self.behaviour == SessionBehaviour::ClearOnExitCloseOnDelete {
             self.clear = false;
         }
-        self.delete.push(Delete{epoch: epoch, address: address, value: value});
+        self.delete.push(Delete{epoch: epoch, value: value});
     }
 
     pub fn collect(&mut self) {
@@ -532,7 +554,7 @@ impl <'a, P> Session<'a, P> {
         while self.delete.len() > 0 {
             let e = self.delete.get(0).unwrap().epoch;
             if e+2 <= epoch {
-                self.free_addr.push(self.delete.remove(0).address);
+                self.delete.remove(0);
             } else {
                 break;
             }
