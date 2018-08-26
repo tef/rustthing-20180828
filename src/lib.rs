@@ -27,13 +27,13 @@ use std::slice;
 
 
 // todo
-//      descriptor can be commited by multiple threads
-//      insert uses list of empty addresses
-//      remove locked vec from hea delete
-//      heap has list of empty addresses
 //      make a atomicdeque with push/pop left      
+//      heap has queue of free addresses
+//      remove locked vec from heap delete list
+//      descriptor can be commited by multiple threads
 //      handle epoch/active overflow
 //      inline/annotations, tests, docs
+//      actual free list
 //
 //      then, trie?
 
@@ -41,7 +41,6 @@ type Address = usize;
 
 pub struct AtomicPtrVec<T> {
     ptr: *mut AtomicPtr<T>,
-    len: AtomicUsize,
     cap: usize,
 }
 
@@ -51,7 +50,6 @@ impl <T> AtomicPtrVec<T> {
         let mut v: Vec<AtomicPtr<T>> = unsafe { mem::transmute(v)};
         let a = AtomicPtrVec {
             ptr: v.as_mut_ptr(),
-            len: AtomicUsize::new(0),
             cap: v.capacity(),
         };
         mem::forget(v);
@@ -59,24 +57,8 @@ impl <T> AtomicPtrVec<T> {
     }
 
     #[inline]
-    pub fn append(&self, value: *mut T) -> Result<usize, ()> {
-        let index = self.len.fetch_add(1, Ordering::SeqCst);
-        if index >= self.cap {
-            panic!("out of bounds")
-        }
-        unsafe {
-            let ptr = &*self.ptr.offset(index as isize);
-            let old = ptr.compare_and_swap(ptr::null_mut(), value, Ordering::SeqCst);
-            if old.is_null() {
-                Ok(index)
-            } else {
-                Err(())
-            }
-        }
-    }
-    #[inline]
     pub fn load(&self, index: usize) -> *mut T {
-        if index >= self.len.load(Ordering::SeqCst) {
+        if index >= self.cap {
             panic!("out of bounds");
         }
         unsafe {
@@ -106,7 +88,7 @@ impl <T> AtomicPtrVec<T> {
     }
     pub fn as_slice(&mut self) -> &[*mut T] {
         unsafe { 
-            let s = slice::from_raw_parts(self.ptr, self.len.load(Ordering::SeqCst));
+            let s = slice::from_raw_parts(self.ptr, self.cap);
             let s: &[*mut T] = mem::transmute(s);
             s
         }
@@ -117,7 +99,15 @@ impl <T> AtomicPtrVec<T> {
 struct CAS<T> {index: usize, old: *mut T, new: *mut T}
 
 #[derive(PartialEq, Copy, Clone)]
-enum State { Reading = 0, Writing = 1 , Preparing =2, Committing = 3, Committed = 4 , Cancelled = -1, Conflicted = -2 }
+enum State { 
+    Reading = 0,
+    Writing = 1, 
+    Preparing = 2,
+    Committing = 3,
+    Committed = 4,
+    Cancelled = -1,
+    Conflicted = -2
+}
 
 struct Descriptor<T> {
     _state: AtomicIsize,
@@ -387,17 +377,15 @@ impl <'a, 'b, P> Transaction<'a, 'b, P> {
             let d = &mut *self.descriptor;
             let fake = d.tagged_ptr();
             let mut address;
-            while self.session.free_addr.len() > 0 {
-                address = self.session.free_addr.pop().unwrap();
+            loop {
+                address = self.session.next_address();
                 let result = self.vec.compare_and_swap(address, ptr::null_mut(), fake);
                 if result.is_ok() {
                     d.add(address, fake, ptr);
-                    return address;
+                    break;
                 }
             }
-            let addr = self.vec.append(fake).unwrap();
-            d.add(addr, fake, ptr);
-            addr
+            address
         }
     }
     
@@ -533,6 +521,15 @@ impl <'a, P> Session<'a, P> {
         } else {
             self.state = self.collector.exit_session(&self.state);
             self.collector.collect_later(&mut self.delete);
+        }
+    }
+
+    #[inline]
+    fn next_address(&mut self) -> Address {
+        if self.free_addr.len() > 0 {
+            self.free_addr.pop().unwrap()
+        } else { 
+            self.heap.next_address()
         }
     }
 
@@ -731,6 +728,7 @@ impl<T> Drop for Collector<T> {
 pub struct Heap<P> {
     vec: AtomicPtrVec<P>,
     collector: Collector<P>,
+    len: AtomicUsize,
 }
 
 impl <P> Heap<P> {
@@ -739,9 +737,15 @@ impl <P> Heap<P> {
         let e = AtomicUsize::new(0);
         let d = Vec::with_capacity(100);
         Heap {
+            len: AtomicUsize::new(0),
             vec: t,
             collector: Collector { state: e, delete: Mutex::new(d) },
         }
+    }
+
+    #[inline]
+    pub fn next_address(&self) -> Address {
+        self.len.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn session<'a>(&'a self) -> Session<'a, P> {
