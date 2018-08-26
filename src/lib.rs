@@ -1,34 +1,29 @@
-#![allow(unused_imports,dead_code,unused_variables,unused_mut,unused_assignments)]
 
 use std::borrow::Borrow;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, AtomicIsize, Ordering};
 use std::ptr;
 use std::mem;
 use std::ops::Deref;
 use std::fmt;
 use std::marker::PhantomData;
-use std::clone::Clone;
 use std::slice;
 
 
 // todo
-//      on read, racing to commit in Descriptor::race()
-//      
-//      remove locks from heap, session delete
-//      list is atomicdeque with push/pop left      
-//
+//      descriptor can be commited by multiple threads
 //      session, heap have lists of empty addresses
 //      insert uses list of empty addresses
-//      
-//      epoch/active overflow
+//      remove locks from heap, session delete
+//      make a atomicdeque with push/pop left      
+//      handle epoch/active overflow
 //      inline/annotations, tests, docs
 //
 //      then, trie?
 
 type Address = usize;
 
-struct AtomicPtrVec<T> {
+pub struct AtomicPtrVec<T> {
     ptr: *mut AtomicPtr<T>,
     len: AtomicUsize,
     cap: usize,
@@ -36,7 +31,7 @@ struct AtomicPtrVec<T> {
 
 impl <T> AtomicPtrVec<T> {
     pub fn new(size: usize) -> AtomicPtrVec<T> {
-        let mut v: Vec<*mut ()> = vec![ptr::null_mut(); size];
+        let v: Vec<*mut ()> = vec![ptr::null_mut(); size];
         let mut v: Vec<AtomicPtr<T>> = unsafe { mem::transmute(v)};
         let a = AtomicPtrVec {
             ptr: v.as_mut_ptr(),
@@ -114,8 +109,9 @@ struct Descriptor<T> {
 }
 
 impl <T> Descriptor<T> {
+    #[inline]
     fn new() -> Descriptor<T> {
-        let mut vec = Vec::with_capacity(8);
+        let vec = Vec::with_capacity(8);
         Descriptor {
             _state: AtomicIsize::new(State::Reading as isize),
             operations: vec,
@@ -174,7 +170,20 @@ impl <T> Descriptor<T> {
     }
 
     #[inline]
+    fn is_tagged(ptr: *mut T) -> bool {
+        let ptr: usize = unsafe{mem::transmute(ptr)};
+        ptr & 1 == 1
+    }
+    #[inline]
+    unsafe fn untag(other: *mut T) -> *mut Descriptor<T> {
+        let ptr: usize = mem::transmute(other);
+        let ptr: *mut Descriptor<T> = mem::transmute(ptr & (!1 as usize));
+        ptr
+    }
+
+    #[inline]
     fn apply(&mut self, vec: &AtomicPtrVec<T>) -> bool {
+        // XXX: Handle other threads racing to commit this desciptor
         let state = self.state();
         if state == State::Reading {
             self.set_state(State::Committed, Ordering::Relaxed);
@@ -238,6 +247,9 @@ impl <T> Descriptor<T> {
             for x in &self.operations {
                 if x.old == fake {
                     let result = vec.compare_and_swap(x.index, fake, ptr::null_mut());
+                    if result.is_err() {
+                        panic!("sync");
+                    }
                     // check for success, or race
                 }
             }
@@ -245,17 +257,6 @@ impl <T> Descriptor<T> {
         }
     }
 
-    #[inline]
-    fn is_tagged(ptr: *mut T) -> bool {
-        let ptr: usize = unsafe{mem::transmute(ptr)};
-        ptr & 1 == 1
-    }
-    #[inline]
-    unsafe fn race(me: *mut Descriptor<T>, other: *mut T) {
-        let ptr: usize = mem::transmute(other);
-        let ptr: *mut Descriptor<T> = mem::transmute(ptr & (!1 as usize));
-        // panic!("no race");
-    }
 }
 
 pub struct Ref<'a, T:'a> { // make cow
@@ -321,7 +322,8 @@ impl <'a, 'b, P> Transaction<'a, 'b, P> {
                 flag = false;
             } else {
                 unsafe {
-                    Descriptor::race(self.descriptor, ptr)
+                    let _other = Descriptor::untag(ptr);
+                    // XXX: read other descriptor, race the CAS
                 }
             }
         }
@@ -403,12 +405,13 @@ impl<'a, 'b, T> Drop for Transaction<'a, 'b, T> {
             if !d.complete() {
                 d.cancel(&self.vec);
             }
-            let mut d = Box::from_raw(self.descriptor);
+            let d = Box::from_raw(self.descriptor);
             if d.committed() {
                 let epoch = self.collector.epoch();
                 for op in &d.operations {
                     if !op.old.is_null() && !Descriptor::is_tagged(op.old) {
-                        self.session.collect_later(epoch, op.index, op.old);
+                        let b = Box::from_raw(op.old);
+                        self.session.collect_later(epoch, op.index, b);
                     }
                 }
             } else {
@@ -427,7 +430,7 @@ impl<'a, 'b, T> Drop for Transaction<'a, 'b, T> {
 struct Delete<P> {
     epoch: usize,
     address: Address,
-    value: *mut P,
+    value: Box<P>,
 }
 
 #[derive(PartialEq)]
@@ -440,14 +443,15 @@ enum SessionState {
 pub struct Session<'a, P: 'a> {
     heap: &'a Heap<P>,
     collector: &'a Collector<P>,
-    delete: Vec<Delete<P>>, 
+    delete: Vec<Delete<P>>,  // Replace with deque
+    free_addr: Vec<Address>,
     state: SessionState,
     clear: bool,
     behaviour: SessionBehaviour,
 } 
 
 #[derive(PartialEq)]
-enum SessionBehaviour {
+pub enum SessionBehaviour {
     ClearOnExit, CloseOnExit, ClearOnExitCloseOnDelete
 }
 
@@ -459,10 +463,12 @@ impl <'a, P> Session<'a, P> {
             SessionBehaviour::ClearOnExitCloseOnDelete => true,
         };
         let v = Vec::with_capacity(100);
+        let f = Vec::with_capacity(100);
         Session {
             heap: heap, 
             collector: &heap.collector,
             delete: v, 
+            free_addr: f,
             state: SessionState::Inactive, 
             clear: c,
             behaviour: behaviour,
@@ -498,7 +504,7 @@ impl <'a, P> Session<'a, P> {
     }
 
     #[inline]
-    unsafe fn collect_later(&mut self, epoch: usize, address: Address, value: *mut P) {
+    unsafe fn collect_later(&mut self, epoch: usize, address: Address, value: Box<P>) {
         if self.behaviour == SessionBehaviour::ClearOnExitCloseOnDelete {
             self.clear = false;
         }
@@ -507,11 +513,10 @@ impl <'a, P> Session<'a, P> {
 
     pub fn collect(&mut self) {
         let epoch = self.collector.epoch();
-        let mut i = 0;
-        while i < self.delete.len() {
-            let e = self.delete.get(i).unwrap().epoch;
+        while self.delete.len() > 0 {
+            let e = self.delete.get(0).unwrap().epoch;
             if e+2 <= epoch {
-                self.delete.remove(i);
+                self.free_addr.push(self.delete.remove(0).address);
             } else {
                 break;
             }
@@ -546,12 +551,11 @@ impl<P> Collector<P> {
 
     pub fn collect(&self) {
         let epoch = self.epoch();
-        let mut i = 0;
         let mut v = self.delete.lock().unwrap();
-        while i < v.len() {
-            let e = v.get(i).unwrap().epoch;
+        while v.len() > 0 {
+            let e = v.get(0).unwrap().epoch;
             if e+2 <= epoch {
-                v.remove(i);
+                let _d = v.remove(0);
             } else {
                 break;
             }
@@ -581,8 +585,8 @@ impl<P> Collector<P> {
 
     #[inline]
     unsafe fn set_quiet(&self, quiet_epoch: Option<usize>) -> (bool, usize) {
-        let mut epoch = 0;
-        let mut new_epoch = false;
+        let mut epoch;
+        let mut new_epoch;
         loop {
             let state = self.state.load(Ordering::SeqCst); 
             epoch = state & 0x0000_0000_FFFF_FFFF;
@@ -610,8 +614,8 @@ impl<P> Collector<P> {
 
     #[inline]
     unsafe fn decr_active(&self, quiet_epoch: Option<usize>) -> (bool, usize) {
-        let mut epoch = 0;
-        let mut new_epoch = false;
+        let mut epoch;
+        let mut new_epoch;
         loop {
             let state = self.state.load(Ordering::SeqCst);
             epoch = state & 0x0000_0000_FFFF_FFFF;
@@ -726,6 +730,7 @@ impl<T> Drop for Heap<T> {
 }
 
 #[cfg(test)]
+#[allow(unused_imports,dead_code,unused_variables,unused_mut,unused_assignments)]
 mod tests {
     use Heap;
     use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -780,7 +785,7 @@ mod tests {
     }
     #[test]
     fn threadtest() {
-        let nitems = 5000;
+        let nitems = 1000;
         let nthreads = 250;
         let h = Arc::new(Heap::<usize>::new(nitems));
         { 
@@ -800,15 +805,11 @@ mod tests {
                     let mut s = bh.session();
                     loop {
                         let j = (i+o) % nitems;
-                        //print!("thread: {}, item: {}, \n", t,  j);
                         let mut tx = s.transaction();
                         let n = tx.borrow(j).unwrap();
-                        //print!("thread: {}, item: {}, val {} \n", t,  j, n);
                         tx.compare_and_swap(j, n, Box::new(n+1));
                         if tx.apply() { break }
-                        // print!("r");
                     }; 
-                    //print!(".");
                 }
             });
             threads.push(t);
@@ -842,7 +843,7 @@ mod tests {
 
     #[test]
     fn vectest() {
-        let nitems = 5000;
+        let nitems = 1000;
         let nthreads = 250;
 
         let mut v = Vec::with_capacity(nitems);
@@ -859,9 +860,7 @@ mod tests {
                 for i in 0..nitems { 
                     let mut m = bh.lock().unwrap();
                     let j = (i+o) % nitems;
-                    // print!("t");
                     let b : usize = *(m.get(j).unwrap()).clone();
-                    //print!("thread: {}, item: {}, val: {} \n", t,  j , b);
                     m[j] = Box::new(b+1);
                 }
             });
