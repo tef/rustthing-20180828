@@ -1,3 +1,19 @@
+// This is a little involved, forgive me.
+//
+// This is an atomic Vec, of some sorts, that uses optimistic,
+// rather than pessismistic concurrency to operate. 
+//
+// Instead of using a Mutex<Vec...> or a RwLock<Vec...>, or finer
+// grained options, This is a Vec<Box<...>> that allows you to 
+// compare and swap entries atomically.
+//
+// Atop of that, is Keir's Multiple Compare-and-swap algorithm.
+// We CAS in a descriptor pointer, then CAS out the wanted values.
+// When reading, we check for descriptors and wait for them to finish
+//
+// You have a heap object, which you can get a session object from
+// the session object cannot be shared across threads, and from them
+// you can get a transaction object.
 
 use std::borrow::Borrow;
 use std::sync::Mutex;
@@ -12,9 +28,9 @@ use std::slice;
 
 // todo
 //      descriptor can be commited by multiple threads
-//      session, heap have lists of empty addresses
 //      insert uses list of empty addresses
-//      remove locks from heap, session delete
+//      remove locked vec from hea delete
+//      heap has list of empty addresses
 //      make a atomicdeque with push/pop left      
 //      handle epoch/active overflow
 //      inline/annotations, tests, docs
